@@ -1,0 +1,17 @@
+# uv, formatting and local builds
+.uv-cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+*.so
+*.dylib
+
+# Training, evaluation and solver outputs
+runs/
+experiments/
+*.pt
+*.pth
+*.log
+*.sqlite*
+*.bas
