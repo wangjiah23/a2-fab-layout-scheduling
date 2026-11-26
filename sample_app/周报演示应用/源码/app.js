@@ -71,6 +71,7 @@ function switches(){
   if(c.standalone)host.append(el('p','muted','独立布局文件'));
   const ready=!!findResult(c,method);
   $('loadResult').disabled=!ready||!!c.standalone;$('loadResult').textContent=ready?'查看离线结果  →':'暂无离线结果';
+  $('rlRemote').hidden=method!=='rl'||c.local||c.standalone||sceneKey(c.scene)!==baselineKey;
   $('exportJob').hidden=!!(c.standalone||c.local);$('showInputs').disabled=!!c.standalone;
   $('inputFacts').replaceChildren();
   if(c.standalone){$('inputFacts').append(fact('文件类型','独立布局'),fact('设备数',fmt(c.result.after.length)));return;}
@@ -173,6 +174,7 @@ function exportJob(){
 function guide(){
   modal('使用指南',body=>{
     section(body,'现场展示','打开后为全厂启发式 + LP 归档。可先看“指标对照”，再切换到强化学习，点击“查看离线结果”，播放设备逐步放置的过程。');
+    section(body,'运行全厂 PPO','选择全厂基准与强化学习，点“远程训练与推理”。在本机启动仓库中的 RL 控制台后，可连接服务器、部署环境并执行任务。推理完成后点“在工作台对照布局”。');
     section(body,'切换生产输入','通过“导入生产场景”选择 Excel、CSV 或 JSON。模板包含产品需求和新增路线。当前工厂固定为 SMAT2022 LVHM_E，计划期为 7 天。');
     body.append(btn('下载基准场景 XLSX',()=>downloadTemplate('baseline')),btn('下载配比变化 XLSX',()=>downloadTemplate('changed')));
     section(body,'查看外部布局','CSV 至少提供 equipment_name、x、y 三列。可补充 tool_group、bay、width、height。含 layout.csv 和同目录 summary.json 或 e3_summary.json 的 ZIP 也可导入。');
@@ -214,6 +216,23 @@ async function importResult(file){
     }
   }catch(e){if(seq===importSerial)message('导入结果失败。'+e.message,true);}
 }
+const localConsole=['http:','https:'].includes(location.protocol)&&['127.0.0.1','localhost','[::1]'].includes(location.hostname);
+$('rlRemote').onclick=()=>{
+  if(localConsole){location.assign('/rl/');return;}
+  message('请先在仓库 rl/console 目录运行 uv run --locked --python 3.11 python app.py，再打开本机控制台。');
+  window.open('http://127.0.0.1:7860/rl/','_blank','noopener');
+};
+async function loadRemoteResult(){
+  if(!localConsole)return;
+  const token=new URLSearchParams(location.search).get('rl_result');
+  if(!token)return;
+  if(!/^[a-f0-9]{40}$/.test(token)){message('推理结果链接无效。',true);return;}
+  try{
+    const response=await fetch('/rl-results/'+token,{cache:'no-store'});
+    if(!response.ok)throw Error('请在远程运行页重新打开这次推理，或导入已下载的结果包。');
+    await importResult(new File([await response.blob()],'E3-PPO-fab-result.json',{type:'application/json'}));
+  }catch(error){message('读取推理结果失败。'+error.message,true);}
+}
 $('cases').onchange=()=>{importSerial++;chooseCase($('cases').value);};
 $('loadResult').onclick=showResult;$('exportJob').onclick=exportJob;$('template').onclick=()=>downloadTemplate('baseline');
 $('guide').onclick=guide;$('source').onclick=sourceInfo;$('closeDialog').onclick=()=>$('dialog').close();
@@ -225,3 +244,4 @@ $('resultFile').onchange=e=>{const f=e.target.files[0];e.target.value='';importR
 const drop=$('uploadResult');drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag');};drop.ondragleave=()=>drop.classList.remove('drag');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');importResult(e.dataTransfer.files[0]);};
 render();
+loadRemoteResult();

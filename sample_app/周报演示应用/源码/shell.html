@@ -7,7 +7,7 @@
 <section class="side-section"><label for="cases">生产场景</label><select id="cases" aria-label="选择生产场景"><option value="baseline">LVHM · 全厂基准</option><option value="local">A2 / A3 · 局部验证</option><option value="changed">LVHM · 产品配比变化</option></select>
 <button id="uploadScene" class="outline wide">↑&nbsp; 导入生产场景</button><input id="sceneFile" type="file" accept=".xlsx,.csv,.json" hidden><div class="small-links"><button id="template">下载场景模板</button><button id="showInputs">查看输入 ↗</button></div>
 <div id="inputFacts" class="factlist"></div></section>
-<section class="side-section"><div class="side-label">求解方法</div><div id="methods"></div><button id="loadResult" class="primary wide">查看离线结果 <span>→</span></button><button id="exportJob" class="bare wide">导出离线任务 ↓</button></section>
+<section class="side-section"><div class="side-label">求解方法</div><div id="methods"></div><button id="loadResult" class="primary wide">查看离线结果 <span>→</span></button><button id="rlRemote" class="outline wide" hidden>远程训练与推理 ↗</button><button id="exportJob" class="bare wide">导出离线任务 ↓</button></section>
 <section class="side-section last"><h3>外部求解结果</h3><button id="uploadResult" class="dropzone"><b aria-hidden="true">⇧</b><span>导入布局结果</span><small>CSV / JSON / ZIP</small></button><input id="resultFile" hidden type="file" accept=".csv,.json,.zip"><p class="hint">可直接查看在其他程序中求解的布局。</p></section></aside>
 <main><div class="main-head"><div><div class="context" id="context"></div><h1 id="title">全厂设备布局</h1></div><button id="source" class="source">结果来源 ↗</button></div>
 <div id="message" role="status" aria-live="polite" hidden></div><div id="kpis" class="kpis"></div>
