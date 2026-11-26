@@ -2,9 +2,10 @@
 const areaColors={Dry_Etch:'#358c87',Litho:'#b67555',Wet_Etch:'#5e9eb2',TF:'#7589b8',Diffusion:'#75a549',Dielectric:'#d39c53',Litho_Met:'#b481a5',Implant:'#8070a7',Planar:'#b2a647',Def_Met:'#688591',TF_Met:'#9c7883','其他':'#6d9391'};
 const areaLabels={Dry_Etch:'干法刻蚀',Litho:'光刻',Wet_Etch:'湿法刻蚀',TF:'薄膜',Diffusion:'扩散',Dielectric:'介质',Litho_Met:'光刻量测',Implant:'注入',Planar:'平坦化',Def_Met:'缺陷量测',TF_Met:'薄膜量测'};
 const colorFor=area=>Object.hasOwn(areaColors,area)?areaColors[area]:areaColors['其他'];
-function makeMap(host,r,initialName=''){
-  let mode='after',bay='',zoom=1,panX=0,panY=0,selected=initialName,tracks=r.plant,pan=null,plot=[],raf=0,disposed=false;
+function makeMap(host,r,initialName='',replay=null){
+  let mode=replay?'both':'after',bay='',zoom=1,panX=0,panY=0,selected=initialName,tracks=r.plant,pan=null,plot=[],raf=0,disposed=false;
   const before=r.before||[],after=r.after;
+  let step=0,timer=null;
   const maps=[new Map(before.map(e=>[e.equipment_name,e])),new Map(after.map(e=>[e.equipment_name,e]))];
   let example=null,maxMove=0;
   for(const a of after){
@@ -18,7 +19,7 @@ function makeMap(host,r,initialName=''){
   for(const b of bays)select.append(option(b,b));
   const switches=new Map();
   for(const [id,text] of (r.before?[['after','优化布局'],['before','参考布局'],['both','并排对照']]:[['after','导入布局']])){
-    const b=btn(text,()=>{mode=id;for(const [key,item] of switches)item.classList.toggle('on',key===id);reset();});b.classList.toggle('on',id==='after');segments.append(b);switches.set(id,b);
+    const b=btn(text,()=>{mode=id;for(const [key,item] of switches)item.classList.toggle('on',key===id);reset();});b.classList.toggle('on',id===mode);segments.append(b);switches.set(id,b);
   }
   select.onchange=()=>{bay=select.value;reset();};
   tools.append(select);
@@ -36,6 +37,26 @@ function makeMap(host,r,initialName=''){
     const a=el('span'),sw=el('i');sw.style.background=colorFor(area);a.append(sw,document.createTextNode(areaLabels[area]||area));legend.append(a);
   }
   const detail=el('div','info');bottom.append(legend);host.append(top,wrap,bottom,detail);
+  if(replay){
+    const controls=el('div','rlcontrols placement-controls'),slider=el('input'),out=el('output'),action=el('p','placement-action'),speed=el('select');
+    const play=btn('播放',()=>timer===null?start():pause()),prev=btn('上一步',()=>seek(step-1)),next=btn('下一步',()=>seek(step+1));
+    slider.type='range';slider.min=0;slider.max=after.length;slider.step=1;slider.setAttribute('aria-label','推理放置步数');
+    speed.setAttribute('aria-label','每秒放置步数');for(const rate of [5,15,30,60])speed.append(option(rate,rate+' 步/秒'));speed.value='15';
+    function pause(){clearInterval(timer);timer=null;play.textContent='播放';}
+    function update(n){
+      step=Math.max(0,Math.min(after.length,n));const row=replay.rows[step-1];
+      selected=row?.equipment_name||'';slider.value=String(step);out.textContent=step+' / '+after.length+' 台';
+      action.textContent=row?('第 '+step+' 步　'+(replay.automatic.has(step-1)?'同组自动放置':'策略放置')+'　'+row.equipment_name+' → '+row.bay+' · 槽位 '+row.new_slot):'第 0 步　设备尚未放置，固定轨道和 AMHS 已就位。';
+      prev.disabled=step===0;next.disabled=step===after.length;queue();
+    }
+    function seek(n){pause();update(n);}
+    function start(){pause();if(step===after.length)update(0);play.textContent='暂停';timer=setInterval(()=>{update(step+1);if(step===after.length)pause();},1000/Number(speed.value));}
+    speed.onchange=()=>{if(timer!==null)start();};slider.oninput=()=>seek(Number(slider.value));
+    controls.append(play,prev,next,slider,out,speed,btn('终局',()=>seek(after.length)));
+    host.insertBefore(controls,bottom);host.insertBefore(action,bottom);
+    update(0);
+    if(replay.autoplay&&!matchMedia('(prefers-reduced-motion: reduce)').matches)start();
+  }
   const ctx=canvas.getContext('2d');
   function details(){
     detail.replaceChildren();
@@ -73,7 +94,8 @@ function makeMap(host,r,initialName=''){
     const dpr=Math.min(window.devicePixelRatio||1,2);
     if(canvas.width!==Math.round(W*dpr)||canvas.height!==Math.round(H*dpr)){canvas.width=Math.round(W*dpr);canvas.height=Math.round(H*dpr);}
     ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
-    const panels=mode==='both'?[before,after]:[mode==='before'?before:after];
+    const placed=replay?replay.rows.slice(0,step):after;
+    const panels=mode==='both'?[before,placed]:[mode==='before'?before:placed];
     const rowsFor=b=>bay?b.filter(e=>e.bay===bay):b;
     const bound=bounds(rowsFor(before.length?[...before,...after]:after));
     if(r.plant&&!r.local&&!bay){
@@ -100,6 +122,11 @@ function makeMap(host,r,initialName=''){
           ctx.fillStyle='#6a786d';
           for(const e of DB.plant.fixed)if(!bay||e.bay===bay){const x=px(e.x),y=py(e.y);ctx.fillRect(x-1.4,y-1.4,2.8,2.8);}
         }
+      }
+      const progressing=!!replay&&all===placed;
+      if(progressing){
+        ctx.strokeStyle='#cdd9d3';ctx.lineWidth=.55;
+        for(const e of rowsFor(before))ctx.strokeRect(px(e.x)-scale*e.width/2,py(e.y)-scale*e.height/2,scale*e.width,scale*e.height);
       }
       const hits=[],bayPositions=new Map();
       let highlighted=null;
@@ -132,7 +159,7 @@ function makeMap(host,r,initialName=''){
         const {x,y,w,h}=highlighted;ctx.strokeStyle='#101f1e';ctx.lineWidth=2;ctx.strokeRect(x-w/2-2,y-h/2-2,w+4,h+4);
         ctx.strokeStyle='#f0a039';ctx.lineWidth=2;ctx.strokeRect(x-w/2-4,y-h/2-4,w+8,h+8);
       }
-      const label=(mode==='both'?(j?'优化布局':'参考布局'):(r.before?(mode==='before'?'参考布局':'优化布局'):'导入布局'))+'   '+fmt(rows.length)+' 台';
+      const label=(progressing?'推理布局':mode==='both'?(j?'优化布局':'参考布局'):(r.before?(mode==='before'?'参考布局':'优化布局'):'导入布局'))+'   '+fmt(rows.length)+' 台';
       ctx.font='bold 11px "Microsoft YaHei", sans-serif';let tw=ctx.measureText(label).width;
       ctx.fillStyle='#f5f9f2ee';ctx.fillRect(left+7,5,tw+12,20);ctx.fillStyle='#345146';ctx.fillText(label,left+12,19);
       if(j>0){ctx.fillStyle='#c2d1c7';ctx.fillRect(left+1,0,1,H);}
@@ -155,6 +182,6 @@ function makeMap(host,r,initialName=''){
   canvas.onkeydown=e=>{if(e.key==='+'||e.key==='=')scaleAt(1.5);else if(e.key==='-')scaleAt(1/1.5);else if(e.key==='0')reset();else return;e.preventDefault();};
   if(selected){const row=maps[1].get(selected)||maps[0].get(selected);if(row&&row.bay){bay=row.bay;select.value=bay;}}
   const obs=new ResizeObserver(queue);obs.observe(canvas);queue();
-  return ()=>{disposed=true;obs.disconnect();if(raf)cancelAnimationFrame(raf);};
+  return ()=>{disposed=true;clearInterval(timer);obs.disconnect();if(raf)cancelAnimationFrame(raf);};
 }
 const globalRailBounds=DB.plant.rails.reduce((b,s)=>[Math.min(b[0],s[1],s[3]),Math.min(b[1],s[2],s[4]),Math.max(b[2],s[1],s[3]),Math.max(b[3],s[2],s[4])],[Infinity,Infinity,-Infinity,-Infinity]);

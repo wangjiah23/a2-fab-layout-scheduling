@@ -193,7 +193,7 @@ function normalizeLayout(rows){
 function readMetrics(raw){
   if(!raw||typeof raw!=='object')return {};
   const m={};
-  for(const k of ['reference_cost','optimized_cost','elapsed_sec','moved','lp_count']){
+  for(const k of ['reference_cost','optimized_cost','elapsed_sec','moved','lp_count','global_relative_gap_bound','primal_infeasibility']){
     if(raw[k]===undefined||raw[k]===null)continue;
     m[k]=numberField(raw[k],k);
     if(m[k]<0)throw Error('结果指标 '+k+' 必须为非负数。');
@@ -202,11 +202,11 @@ function readMetrics(raw){
   return m;
 }
 async function readResultFile(file){
-  const ext=checkFile(file);let layout,metrics={},scene=null,method=null,source=file.name;
+  const ext=checkFile(file);let layout,metrics={},scene=null,method=null,source=file.name,trace=null;
   if(ext==='json'){
     const data=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
     if(data.schema && data.schema!=='fab-result-v1')throw Error('请选择 fab-result-v1 结果包或布局 CSV。');
-    layout=Array.isArray(data)?data:data.layout;metrics=readMetrics(data.metrics);
+    layout=Array.isArray(data)?data:data.layout;metrics=readMetrics(data.metrics);trace=data.replay;
     if(data.scenario){scene=normalizeScene(data.scenario);method=data.method;if(!['heuristic_lp','rl'].includes(method))throw Error('结果包方法需填写 heuristic_lp 或 rl。');}
   }else if(ext==='csv')layout=objects(csvRows(await file.text()));
   else if(ext==='zip'){
@@ -221,5 +221,16 @@ async function readResultFile(file){
   }else throw Error('结果导入支持布局 CSV、结果 JSON 及含 layout.csv 的 ZIP。');
   const after=normalizeLayout(layout);
   if(scene&&(after.length!==slotByName.size||after.some(r=>!slotByName.has(r.equipment_name))))throw Error('带全厂场景的结果包应包含本厂全部 1,068 台生产设备，各出现一次。局部布局可以单独导入 CSV。');
-  return {kind:'external',title:'导入的设备布局',source,after,before:scene?DB.plant.slots:null,plant:!!scene,scene,method,metrics};
+  let replay=null;
+  if(trace!=null){
+    if(method!=='rl'||!scene||!Array.isArray(trace.slots)||trace.slots.length!==after.length)throw Error('推理回放与全厂设备数不一致。');
+    const bySlot=new Map(after.map(row=>[row.new_slot,row])),n=after.length;
+    if(bySlot.size!==n||new Set(trace.slots).size!==n||trace.slots.some(i=>!Number.isInteger(i)||i<0||i>=n||!bySlot.has(i)))throw Error('回放必须按真实动作逐一填满每个槽位。');
+    const automatic=trace.automatic_steps||[];
+    if(!Array.isArray(automatic)||automatic.some(i=>!Number.isInteger(i)||i<0||i>=n))throw Error('回放的自动放置步号无效。');
+    if(Number.isInteger(trace.cycle))source='PPO · 第 '+trace.cycle+' 轮检查点';
+    replay={rows:trace.slots.map(slot=>bySlot.get(slot)),automatic:new Set(automatic),
+      cycle:Number.isInteger(trace.cycle)?trace.cycle:null,checkpoint:typeof trace.checkpoint==='string'?trace.checkpoint:''};
+  }
+  return {kind:'external',title:replay?'PPO 推理布局':'导入的设备布局',source,replay,after,before:scene?DB.plant.slots:null,plant:!!scene,scene,method,metrics};
 }

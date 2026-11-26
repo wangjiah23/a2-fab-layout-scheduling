@@ -41,7 +41,7 @@ function modal(title,content){
 }
 function section(body,title,text){body.append(el('h3','',title),el('p','',text));}
 function fact(key,value){const row=el('div');row.append(el('span','',key),el('b','',value));return row;}
-function firstTab(r){return !r?'pending':r.kind==='rl'?'replay':'map';}
+function firstTab(r){return !r?'pending':r.kind==='rl'||r.replay?'replay':'map';}
 function addCase(key,c){
   cases.set(key,c);$('cases').append(option(key,c.label));return key;
 }
@@ -96,16 +96,23 @@ function metrics(){
   if(m.cost_reduction_pct!==undefined){
     box.append(metric('运输成本降幅',grade(m.cost_reduction_pct),'%',true),metric('布局设备',fmt(r.after.length),'台'));
     if(m.moved!==undefined)box.append(metric('调整机位的设备',fmt(m.moved),'台'));
-    if(m.elapsed_sec!==undefined)box.append(metric('离线求解耗时',grade(m.elapsed_sec),'秒'));
+    if(m.elapsed_sec!==undefined)box.append(metric(r.replay?'推理及 LP 耗时':'离线求解耗时',grade(m.elapsed_sec),'秒'));
   }else{
     box.append(metric('导入设备',fmt(r.after.length),'台',true),metric('文件中的 Bay',new Set(r.after.map(e=>e.bay).filter(Boolean)).size,'个'),
       metric('文件中的设备组',new Set(r.after.map(e=>e.tool_group).filter(Boolean)).size,'组'));
   }
 }
 function resultTabs(){
+  const tabs=layoutTabs();
+  if(onlineAvailable())tabs.unshift(['online','在线运行']);
+  return tabs;
+}
+function onlineAvailable(){return method==='rl'&&!chosen().local&&!chosen().standalone&&sceneKey(chosen().scene)===baselineKey;}
+function layoutTabs(){
   const c=chosen(),r=result;if(!r)return [['pending','场景状态'],['inputs','输入数据']];
   if(r.kind==='rl')return [['replay','布局回放'],['chart','训练评估'],['inputs','输入数据']];
   const list=[['map','布局视图'],['table','设备明细']];
+  if(r.replay)list.unshift(['replay','推理回放']);
   if(r.local)list.push(['flow','加工与物流']);
   if(r.metrics?.reference_cost!==undefined||r.metrics?.optimized_cost!==undefined)list.push(['metrics','指标对照']);
   if(!c.standalone)list.push(['inputs','输入数据']);return list;
@@ -123,7 +130,9 @@ function showMetrics(host,r){
   if(m.reference_cost!==undefined&&m.optimized_cost!==undefined)rows.push(['运输成本减少量',fmt(m.reference_cost-m.optimized_cost,2),'使用实验记录中的原始目标单位']);
   if(m.cost_reduction_pct!==undefined)rows.push(['相对参考布局降幅',grade(m.cost_reduction_pct)+'%',local?'仅统计受区域决策影响的成本':'相对该次实验的参考布局']);
   if(m.lp_count!==undefined)rows.push(['LP 调用次数',fmt(m.lp_count)+' 次','本次归档的运行统计']);
-  if(m.elapsed_sec!==undefined)rows.push(['离线求解耗时',grade(m.elapsed_sec)+' 秒',local?'MILP 主求解阶段':'来自本次运行记录']);
+  if(m.elapsed_sec!==undefined)rows.push([r.replay?'推理及 LP 耗时':'离线求解耗时',grade(m.elapsed_sec)+' 秒',local?'MILP 主求解阶段':'来自本次运行记录']);
+  if(r.replay&&m.global_relative_gap_bound!==undefined)rows.push(['终局 LP 相对间隙上界',(m.global_relative_gap_bound*100).toExponential(2)+' %','终局运输 LP 的最优性证书']);
+  if(r.replay&&m.primal_infeasibility!==undefined)rows.push(['终局 LP 可行性残差',String(m.primal_infeasibility),'求解器报告的最大原始不可行量']);
   host.append(simpleTable(['指标','数值','口径'],rows));
   if(r.kind==='e3')host.append(el('p','details-caption','工厂轨道显示可用运输网络。本次 E3 归档含最终布局和汇总指标；逐工序加工与运输分配可在 A2 / A3 局部案例查看。'));
 }
@@ -135,9 +144,15 @@ function showTab(id,focus=''){
     const item=btn(label,()=>showTab(k),k===id?'on':'');item.setAttribute('aria-current',k===id?'page':'false');tabHost.append(item);
   }
   const expand=btn('放大视图',toggleExpanded,'expand-view');expand.id='expandView';expand.title='展开以便投影，按 Esc 返回';tabHost.append(expand);syncExpanded();
-  if(id==='map')cleanup=makeMap(host,r,focus);
+  const online=id==='online';
+  $('title').textContent=online?'全厂 PPO 训练与推理':r?r.title:c.local?'A2 / A3 区域场景':c.label.replace(/^LVHM · /,'').replace(/^导入 · /,'')+' · 场景输入';
+  $('footerContext').textContent=r&&!online?'来源 · '+r.source:'当前场景 · '+c.label+'  /  '+methodLabel(method);
+  $('source').hidden=!r||online;$('kpis').hidden=online;
+  $('remotePanel').hidden=!online;host.hidden=online;
+  if(id==='online')openRemote();
+  else if(id==='map')cleanup=makeMap(host,r,focus);
   else if(id==='table')layoutTable(host,r,n=>showTab('map',n));
-  else if(id==='replay')cleanup=replayView(host);
+  else if(id==='replay')cleanup=r.replay?makeMap(host,r,'',r.replay):replayView(host);
   else if(id==='chart')cleanup=chartView(host);
   else if(id==='flow')localFlow(host);
   else if(id==='metrics')showMetrics(host,r);
@@ -160,9 +175,6 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.class
 function render(){
   const c=chosen(),r=result;switches();metrics();
   $('context').textContent=c.standalone?'外部文件  /  布局查看':('SMAT2022 · LVHM_E  /  '+(c.local?'区域验证':'全厂规划'));
-  $('title').textContent=r?r.title:c.local?'A2 / A3 区域场景':c.label.replace(/^LVHM · /,'').replace(/^导入 · /,'')+' · 场景输入';
-  $('source').hidden=!r;
-  $('footerContext').textContent=r?('来源 · '+r.source):('当前场景 · '+c.label+'  /  '+methodLabel(method));
   showTab(tab,focused);
 }
 function exportJob(){
@@ -174,7 +186,7 @@ function exportJob(){
 function guide(){
   modal('使用指南',body=>{
     section(body,'现场展示','打开后为全厂启发式 + LP 归档。可先看“指标对照”，再切换到强化学习，点击“查看离线结果”，播放设备逐步放置的过程。');
-    section(body,'运行全厂 PPO','选择全厂基准与强化学习，点“远程训练与推理”。在本机启动仓库中的 RL 控制台后，可连接服务器、部署环境并执行任务。推理完成后点“在工作台对照布局”。');
+    section(body,'运行全厂 PPO','选择全厂基准与强化学习，点“远程训练与推理”。在在线运行页连接服务器，可分别指定推理设备和训练设备。推理结束后自动载入实际动作，可逐台查看至终局。');
     section(body,'切换生产输入','通过“导入生产场景”选择 Excel、CSV 或 JSON。模板包含产品需求和新增路线。当前工厂固定为 SMAT2022 LVHM_E，计划期为 7 天。');
     body.append(btn('下载基准场景 XLSX',()=>downloadTemplate('baseline')),btn('下载配比变化 XLSX',()=>downloadTemplate('changed')));
     section(body,'查看外部布局','CSV 至少提供 equipment_name、x、y 三列。可补充 tool_group、bay、width、height。含 layout.csv 和同目录 summary.json 或 e3_summary.json 的 ZIP 也可导入。');
@@ -188,7 +200,8 @@ function sourceInfo(){
     section(body,r.source,r.kind==='e3'?'week7_heuristic.zip 内的 e3_global/layout.csv 与 e3_summary.json。参考设备位及轨道来自 SMAT2022 LVHM_E。':
       r.kind==='rl'?'A2_期中汇报.pptx 第 19 页原始图表数据与第 20 页第 95 轮布局动画。记录按原顺序抽帧，支持逐段播放。':
       r.local?'week6/MILP交互展示.html 内嵌的机位、加工分配、边界物流及求解汇总。':(r.scene?'文件包含场景、求解方法与完整设备布局，已在本次会话中关联。':'按文件内的设备坐标独立绘制。'));
-    section(body,'求解方式','归档案例的计算在软件外完成，工作台负责核对输入、加载已有输出并可视化。');
+    if(r.replay)section(body,'推理记录',(r.replay.checkpoint||'PPO 检查点')+' · 第 '+(r.replay.cycle??'—')+' 轮，含 '+r.replay.rows.length+' 次实际放置。终局成本来自该布局的运输 LP。');
+    else section(body,'求解方式','归档案例在软件外计算。工作台核对输入并展示已有结果。');
     if(r.kind==='e3')section(body,'指标口径','运输成本按原实验的 LP 目标计量，耗时为该次离线求解记录。布局与固定轨道可逐 Bay 查看。');
     if(r.kind==='rl')section(body,'记录范围','评估曲线覆盖第 0 至 295 轮，回放取自第 95 轮。此次归档提供过程图像与评估数据。');
     if(r.local)section(body,'区域边界','以 E1 全厂参考解固定区外边界流量。降幅以受区域调整影响的运输成本为分母。');
@@ -203,34 +216,62 @@ async function importScene(file){
     message('已导入 '+file.name+'。'+(findResult(chosen(),method)?'场景内容与归档匹配，可查看离线结果。':'当前输入尚无该方法的结果，可导出离线任务。'));
   }catch(e){if(seq===importSerial)message('导入场景失败。'+e.message,true);}
 }
-async function importResult(file){
+async function importResult(file,autoplay=false){
   if(!file)return;const seq=++importSerial;
   try{
     const r=await readResultFile(file);if(seq!==importSerial)return;
+    if(autoplay&&(tab!=='online'||!onlineAvailable()))return;
     if(r.scene){
       const id=caseForScene(r.scene,file.name);externalRegistry.set(registryId(r.scene,r.method),r);
-      chooseCase(id,r.method);result=r;tab='map';render();message('已导入 '+file.name+'，完整布局已与该场景和方法关联。');
+      chooseCase(id,r.method);result=r;if(r.replay)r.replay.autoplay=autoplay;tab=firstTab(r);render();message(r.replay?'已载入 '+r.replay.rows.length+' 步推理记录。':'已导入 '+file.name+'，完整布局已与该场景和方法关联。');
     }else{
       const id=addCase('file'+(++counter),{standalone:true,label:'布局 · '+file.name,result:r});
       chooseCase(id);message('已导入 '+file.name+'，展示文件内 '+fmt(r.after.length)+' 台设备的坐标。');
     }
+    return r;
   }catch(e){if(seq===importSerial)message('导入结果失败。'+e.message,true);}
 }
 const localConsole=['http:','https:'].includes(location.protocol)&&['127.0.0.1','localhost','[::1]'].includes(location.hostname);
-$('rlRemote').onclick=()=>{
-  if(localConsole){location.assign('/rl/');return;}
-  message('请先在仓库 rl/console 目录运行 uv run --locked --python 3.11 python app.py，再打开本机控制台。');
-  window.open('http://127.0.0.1:7860/rl/','_blank','noopener');
-};
-async function loadRemoteResult(){
-  if(!localConsole)return;
-  const token=new URLSearchParams(location.search).get('rl_result');
-  if(!token)return;
+let remoteFrame=null,lastResultToken='',pendingResultToken='';
+function openRemote(){
+  const host=$('remotePanel');
+  if(!localConsole){
+    if(!host.childElementCount)callout(host,'在线运行需要本机服务','在仓库 rl/console 下运行 uv run --locked --python 3.11 python app.py，再打开 http://127.0.0.1:7860 。此离线文件可直接导入含动作的 JSON 回放。');
+    return;
+  }
+  if(!remoteFrame){
+    remoteFrame=el('iframe','remote-frame');remoteFrame.title='远程训练与推理';remoteFrame.src='/rl/panel/?__theme=light';
+    remoteFrame.onload=()=>{
+      const doc=remoteFrame.contentDocument;
+      const fit=()=>{
+        const log=doc?.getElementById('rl-task-log');
+        if(!log||!log.offsetHeight)return;
+        const height=Math.ceil(log.getBoundingClientRect().bottom+remoteFrame.contentWindow.scrollY+22);
+        if(height>0)remoteFrame.style.height=Math.max(420,height)+'px';
+      };
+      if(doc?.body){new ResizeObserver(fit).observe(doc.body);new MutationObserver(fit).observe(doc.body,{childList:true,subtree:true});fit();}
+
+    };
+    host.append(remoteFrame);
+  }
+  if(pendingResultToken){const token=pendingResultToken;pendingResultToken='';loadRemoteResult(token,true);}
+}
+$('rlRemote').onclick=()=>showTab('online');
+window.addEventListener('message',event=>{
+  if(!localConsole||event.origin!==location.origin||event.source!==remoteFrame?.contentWindow||event.data?.type!=='fab-rl-result')return;
+  const token=event.data.token;if(typeof token!=='string'||!/^[a-f0-9]{40}$/.test(token)||(token===lastResultToken&&!event.data.force))return;
+  if(tab==='online'&&onlineAvailable())loadRemoteResult(token,true);
+  else if(token!==lastResultToken)pendingResultToken=token;
+});
+async function loadRemoteResult(token,autoplay=false){
+  if(!localConsole||!token)return;
   if(!/^[a-f0-9]{40}$/.test(token)){message('推理结果链接无效。',true);return;}
   try{
     const response=await fetch('/rl-results/'+token,{cache:'no-store'});
     if(!response.ok)throw Error('请在远程运行页重新打开这次推理，或导入已下载的结果包。');
-    await importResult(new File([await response.blob()],'E3-PPO-fab-result.json',{type:'application/json'}));
+    const file=new File([await response.blob()],'E3-PPO-fab-result.json',{type:'application/json'});
+    if(autoplay&&(tab!=='online'||!onlineAvailable())){pendingResultToken=token;return;}
+    if(await importResult(file,autoplay))lastResultToken=token;
   }catch(error){message('读取推理结果失败。'+error.message,true);}
 }
 $('cases').onchange=()=>{importSerial++;chooseCase($('cases').value);};
@@ -243,5 +284,6 @@ $('sceneFile').onchange=e=>{const f=e.target.files[0];e.target.value='';importSc
 $('resultFile').onchange=e=>{const f=e.target.files[0];e.target.value='';importResult(f);};
 const drop=$('uploadResult');drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag');};drop.ondragleave=()=>drop.classList.remove('drag');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');importResult(e.dataTransfer.files[0]);};
-render();
-loadRemoteResult();
+if(localConsole&&location.pathname.replace(/\/$/,'')==='/rl'){chooseCase('baseline','rl');showTab('online');}
+else render();
+loadRemoteResult(new URLSearchParams(location.search).get('rl_result'));

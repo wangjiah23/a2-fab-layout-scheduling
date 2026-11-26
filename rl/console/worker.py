@@ -179,24 +179,49 @@ def terminate_group(pid, proc=None):
         pass
 
 
+def owns_child_group(job, child):
+    if not child:
+        return False
+    try:
+        if active_identity(child):
+            return os.getpgid(child[0]) == child[0]
+    except ProcessLookupError:
+        pass
+    # A torchrun launcher can disappear before its ranks. Only reclaim a surviving
+    # group when a member still carries the job marker inherited at launch.
+    marker = os.fsencode("A2_FAB_JOB=" + str(job))
+    for row in capture(["ps", "-eo", "pid=,pgid="]).splitlines():
+        pid, group = row.split()
+        if int(group) != child[0]:
+            continue
+        try:
+            if marker in Path("/proc", pid, "environ").read_bytes().split(b"\0"):
+                return True
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+    return False
+
+
 def reconcile(job):
     state = read(job / "state.json")
-    if state["status"] not in FINAL and not active_identity(read(job / "owner.json")):
-        # The worker may have committed its terminal state while we checked the PID.
+    if state["status"] in FINAL:
+        return state
+    try:
+        owner = read(job / "owner.json")
+    except FileNotFoundError:
+        owner = None
+    if not active_identity(owner):
         state = read(job / "state.json")
         if state["status"] in FINAL:
             return state
         child = state.get("child")
-        if active_identity(child):
-            try:
-                if os.getpgid(child[0]) == child[0]:
-                    terminate_group(child[0])
-            except ProcessLookupError:
-                pass
-            except (OSError, subprocess.SubprocessError) as exc:
-                state.update(status="cleanup", detail=f"回收任务进程组失败：{exc}")
-                save(job / "state.json", state)
-                return state
+        try:
+            if owns_child_group(job, child):
+                terminate_group(child[0])
+        except (OSError, subprocess.SubprocessError) as exc:
+            state.update(status="cleanup", detail=f"回收任务进程组失败：{exc}")
+            save(job / "state.json", state)
+            return state
         state.update(status="failed", detail="远程管理进程已退出，请查看日志。", ended=time.time())
         save(job / "state.json", state)
     return state
@@ -235,66 +260,82 @@ def checkpoint_path(choice):
 
 def model_settings(args, host):
     kind = args.get("kind")
-    cpu = args.get("device") == "cpu"
-    gpu = next((g for g in host["gpus"] if g["uuid"] == args.get("device")), None)
-    if not cpu and not gpu:
+    devices = args.get("devices", [args.get("device")])
+    if (
+        not isinstance(devices, list)
+        or not devices
+        or not all(isinstance(d, str) for d in devices)
+        or len(devices) != len(set(devices))
+        or (len(devices) > 1 and (kind != "train" or "cpu" in devices))
+    ):
+        raise ValueError("推理请选择一个设备，训练可选 CPU 或多张不同的 GPU。")
+    world = len(devices)
+    gpu_by_id = {g["uuid"]: g for g in host["gpus"]}
+    gpu = devices != ["cpu"]
+    if gpu and any(d not in gpu_by_id for d in devices):
         raise ValueError("所选 GPU 不可用，请刷新资源。")
     ram = integer(args, "ram_gib", 0, 4096) * 1024
     available = host["ram_free"]
     if available <= 0 or ram > available:
-        raise ValueError(f"当前只有 {available} MiB 可用内存。")
+        raise ValueError(f"当前可分配内存为 {available} MiB。")
     gpu_limit = integer(args, "vram_gib", 0, 256) * 1024
     workers = integer(args, "workers", 0, min(host["cpus"], 64))
     budget = dict(
         kind=kind,
-        device=args["device"],
-        ram_mib=ram or max(1, int(available * 0.8)),
+        device=devices[0],
+        devices=devices,
+        ram_mib=ram or max(1, min(int(available * 0.8), 6144 if kind == "infer" else available)),
         workers=workers or 1,
     )
     if gpu:
-        capacity = min(gpu["free"] - 512, int(0.96 * gpu["total"]))
+        cards = [gpu_by_id[d] for d in devices]
+        capacity = min(min(g["free"] - 512, int(0.96 * g["total"])) for g in cards)
         if capacity <= 0 or gpu_limit > capacity:
-            raise ValueError(f"GPU {gpu['index']} 可用 {gpu['free']} MiB，请降低显存预算或换卡。")
+            raise ValueError("所选 GPU 的可用显存不足，请降低每卡显存预算或换卡。")
         limit = gpu_limit or max(1, int(capacity * 0.85))
+        fractions = [limit / g["total"] for g in cards]
+        fit = [min(0.99, (g["total"] - g["free"] + limit) / g["total"]) for g in cards]
         budget.update(
             vram_mib=limit,
-            allocator_fraction=limit / gpu["total"],
-            fit_fraction=min(0.99, (gpu["total"] - gpu["free"] + limit) / gpu["total"]),
+            allocator_fraction=fractions[0],
+            fit_fraction=fit[0],
+            allocator_fractions=fractions,
+            fit_fractions=fit,
         )
     if kind == "train":
-        batch = integer(args, "batch", 0, 256)
-        if batch == 1:
-            raise ValueError("每轮完整布局数可填 0 自动，或填 2 到 256。")
+        batch = integer(args, "batch", 0, 256 * world)
+        if batch and (batch < 2 or batch % world):
+            raise ValueError(f"每轮总布局数须至少为 2，且可被设备数 {world} 整除。")
         idle = host.get("idle_cpus", host["cpus"])
-        # The LP master uses one CPU thread per solve. Allow for the policy,
-        # CUDA pricing and the base process before budgeting solver copies.
-        lp_slots = min(64, max(1, idle - max(1, idle // 12)), max(1, (budget["ram_mib"] - 1792) // 256))
+        lp_slots = min(
+            64, max(1, idle - max(1, idle // 12)), max(1, (budget["ram_mib"] - 1792 * world) // 256)
+        )
+        if world > host["cpus"] or (workers and workers < world):
+            raise ValueError("每个训练进程至少需要一个 CPU 和一个 LP 工作线程。")
+        if world > 1 and budget["ram_mib"] < world * 2048:
+            raise ValueError("多卡训练的主存预算不足，每卡至少预留 2 GiB。")
         if not batch:
-            if gpu:
-                # Leave headroom over measured full-factory E3 peaks for 8–64 layouts.
-                tiers = ((4, 2048), (8, 3584), (16, 5632), (32, 9728), (64, 18432))
-                cap = max((n for n, mib in tiers if budget["vram_mib"] >= mib), default=2)
-            else:
-                cap = 8
-            cap = min(cap, 4 * min(workers or lp_slots, lp_slots))
-            batch = 1 << (cap.bit_length() - 1)
+            tiers = ((4, 2048), (8, 3584), (16, 5632), (32, 9728), (64, 18432))
+            cap = max((n for n, mib in tiers if budget["vram_mib"] >= mib), default=2) if gpu else 8
+            cap = min(cap, 4 * max(1, min(workers or lp_slots, lp_slots) // world))
+            batch = (1 << (cap.bit_length() - 1)) * world
         budget.update(
             cycles=integer(args, "cycles", 1, 10000),
             batch=batch,
-            workers=workers or min(batch, lp_slots),
+            workers=workers or max(world, min(batch, lp_slots)),
             auto_batch=args["batch"] == 0,
             auto_workers=workers == 0,
         )
     return budget
 
 
-def validate(args):
+def validate(args, host=None):
     kind = args.get("kind")
     if kind == "setup":
         return {"kind": kind}
     if kind not in ("train", "infer") or not READY.is_file():
         raise ValueError("请先完成环境部署。")
-    settings = model_settings(args, resources())
+    settings = model_settings(args, resources() if host is None else host)
     if kind == "infer":
         settings["checkpoint"] = str(checkpoint_path(args.get("checkpoint")))
     return settings
@@ -386,16 +427,24 @@ def model_command(options, out):
     infer = options["kind"] == "infer"
     gpu = options["device"] != "cpu"
     python = str(CODE / ".venv/bin/python")
+    devices = options.get("devices", [options["device"]])
+    world = len(devices)
     cmd = [python, "-m", "smat_rl.train"]
     if gpu:
-        # Apply the same allocator cap to inference and training, before model allocation.
-        cmd = [
-            python,
-            "-c",
-            "import runpy,torch; torch.cuda.set_per_process_memory_fraction("
-            + repr(options["allocator_fraction"])
-            + "); runpy.run_module('smat_rl.train',run_name='__main__')",
-        ]
+        # --run-path keeps spawned ranks in the supervised launcher's process group.
+        cmd = [python]
+        if world > 1:
+            cmd += [
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc-per-node={world}",
+                "--start-method=spawn",
+                "--run-path",
+                "--",
+            ]
+        cmd += [str(Path(__file__).resolve()), "--rank", str(out.parent / "request.json")]
     cmd += [
         "--run",
         str(out),
@@ -419,27 +468,47 @@ def model_command(options, out):
         "--cycles",
         str(options["cycles"]),
         "--envs-per-rank",
-        str(options["batch"]),
+        str(options["batch"] // world),
     ]
     if gpu:
-        cmd += ["--gpu-memory-fraction", str(options["fit_fraction"]), "--gradient-batch", "4096"]
+        cmd += ["--gradient-batch", "4096"]
     else:
         cmd += ["--gradient-batch", "8"]
     return cmd
 
 
-def group_usage(pgid, gpu):
+def run_rank(request_path, argv):
+    import runpy
+
+    import torch
+
+    options = read(Path(request_path))
+    rank = int(os.environ.get("LOCAL_RANK", 0))
+    devices = options.get("devices", [options["device"]])
+    torch.cuda.set_device(rank)
+    torch.cuda.set_per_process_memory_fraction(options["allocator_fractions"][rank], rank)
+    workers, extra = divmod(options["workers"], len(devices))
+    argv[argv.index("--lp-workers") + 1] = str(workers + int(rank < extra))
+    if options["kind"] == "train":
+        argv += ["--gpu-memory-fraction", str(options["fit_fractions"][rank])]
+    # The uploaded rank script lives in helpers/, separate from the pinned RL package.
+    sys.path.insert(0, str(CODE))
+    sys.argv = ["smat_rl.train", *argv]
+    runpy.run_module("smat_rl.train", run_name="__main__")
+
+
+def group_usage(pgid, devices):
     rows = [line.split() for line in capture(["ps", "-eo", "pid=,pgid=,rss="]).splitlines()]
     members = {int(pid): int(rss) for pid, group, rss in rows if int(group) == pgid}
     ram = sum(members.values()) // 1024
-    vram = 0
-    if gpu != "cpu":
+    usage = {key: 0 for key in devices if key != "cpu"}
+    if usage:
         for pid, key, memory in gpu_query("compute-apps", "pid,gpu_uuid,used_gpu_memory"):
-            if pid.isdigit() and int(pid) in members and key == gpu:
+            if pid.isdigit() and int(pid) in members and key in usage:
                 if not memory.isdigit():
                     raise ValueError("无法读取任务 GPU 显存。")
-                vram += int(memory)
-    return ram, vram
+                usage[key] += int(memory)
+    return ram, usage
 
 
 class Stopped(Exception):
@@ -450,6 +519,15 @@ def execute(job, account_fd=None):
     options = read(job / "request.json")
     state = read(job / "state.json")
     proc = None
+    if account_fd is not None:
+        import fcntl
+        from threading import Thread
+
+        try:
+            fcntl.flock(account_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # A disjoint inference may join a legacy job already holding the exclusive lock.
+            Thread(target=fcntl.flock, args=(account_fd, fcntl.LOCK_SH), daemon=True).start()
 
     def request_stop(*_):
         (job / "stop").touch()
@@ -466,6 +544,7 @@ def execute(job, account_fd=None):
         env = {
             **os.environ,
             "PYTHONUNBUFFERED": "1",
+            "A2_FAB_JOB": str(job),
             "GIT_TERMINAL_PROMPT": "0",
             "OMP_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",
@@ -481,6 +560,7 @@ def execute(job, account_fd=None):
         setup = options["kind"] == "setup"
         if options["kind"] == "train":
             print(f"每轮 {options['batch']} 个完整布局，{options['workers']} 个并行 LP", flush=True)
+        devices = options.get("devices", [options.get("device")])
         if setup:
             gpus = resources()["gpus"]
             if gpus:
@@ -488,7 +568,7 @@ def execute(job, account_fd=None):
         else:
             for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE"):
                 env.pop(key, None)
-            env["CUDA_VISIBLE_DEVICES"] = "" if options["device"] == "cpu" else options["device"]
+            env["CUDA_VISIBLE_DEVICES"] = "" if options["device"] == "cpu" else ",".join(devices)
             if "vram_mib" in options:
                 env["CUPY_GPU_MEMORY_LIMIT"] = str(options["vram_mib"] * MIB)
         steps = (
@@ -523,10 +603,14 @@ def execute(job, account_fd=None):
                 if (job / "stop").exists():
                     raise Stopped()
                 if not setup:
-                    rss, vram = group_usage(proc.pid, options["device"])
+                    rss, per_gpu = group_usage(proc.pid, devices)
+                    vram = sum(per_gpu.values())
+                    state["vram_by_gpu"] = per_gpu
                     state.update(rss=rss, vram=vram, peak_vram=max(state.get("peak_vram", 0), vram))
                     save(job / "state.json", state)
-                    if rss > options["ram_mib"] or vram > options.get("vram_mib", math.inf):
+                    if rss > options["ram_mib"] or max(per_gpu.values(), default=0) > options.get(
+                        "vram_mib", math.inf
+                    ):
                         raise RuntimeError(f"超过任务资源预算，RSS {rss} MiB，显存 {vram} MiB")
                 time.sleep(1.5)
             if (job / "stop").exists():
@@ -570,31 +654,72 @@ def tail(path, size=12000):
         return f.read(size).decode(errors="replace").replace("\r", "\n")
 
 
-def start_job(config):
+def active_jobs(root):
+    for path in (root / "jobs").glob("*/state.json"):
+        state = read(path)
+        if state["status"] in FINAL:
+            continue
+        job = path.parent
+        owner = job / "owner.json"
+        if (owner.is_file() and active_identity(read(owner))) or owns_child_group(job, state.get("child")):
+            yield job.name, read(job / "request.json"), state
+
+
+def available_for_jobs(host, active):
+    available = dict(host)
+    assigned = {}
+    for job_id, cfg, state in active:
+        for device in cfg.get("devices", [cfg.get("device")]):
+            assigned[device] = job_id
+        # Resident pages are already excluded by the OS's MemAvailable.
+        available["ram_free"] -= max(0, cfg.get("ram_mib", 0) - state.get("rss", 0))
+        available["cpus"] -= cfg.get("workers", 1)
+    available["idle_cpus"] = min(available["cpus"], host.get("idle_cpus", host["cpus"]))
+    return available, assigned
+
+
+def start_job(request):
     import fcntl
 
+    # Serialize admission across deployment directories, including the interval before CUDA allocates.
     ACCOUNT_LOCK.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with ACCOUNT_LOCK.open("a+") as slot:
+    with (ACCOUNT_LOCK.parent / "dispatch.lock").open("a") as admission, ACCOUNT_LOCK.open("a+") as slot:
+        fcntl.flock(admission, fcntl.LOCK_EX)
         try:
-            fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(slot, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            legacy = False
         except BlockingIOError:
-            slot.seek(0)
-            raise ValueError(f"该账号已有任务运行，请连接其部署目录查看：{slot.read().strip()}") from None
-        # Older default-root workers predate the account-wide lock.
-        old_root = Path.home() / ".local/share/a2-fab-rl"
-        pointer = old_root / "latest.json"
-        if old_root.resolve() != ROOT and pointer.is_file():
-            old = old_root / "jobs" / read(pointer)
-            if (old / "state.json").is_file():
-                other = read(old / "state.json")
-                if other["status"] not in FINAL and (
-                    active_identity(read(old / "owner.json")) or active_identity(other.get("child"))
-                ):
-                    raise ValueError(f"该账号已有任务在 {old_root} 运行。")
+            legacy = True
         slot.seek(0)
-        slot.truncate()
-        slot.write(str(ROOT))
-        slot.flush()
+        previous = slot.read().strip()
+        roots = {ROOT, Path.home() / ".local/share/a2-fab-rl"}
+        if previous and Path(previous).is_absolute():
+            roots.add(Path(previous))
+        active = []
+        for root in roots:
+            jobs = list(active_jobs(root))
+            if root != ROOT and jobs:
+                raise ValueError(f"该账号在 {root} 有运行中的任务，请在同一目录分配设备。")
+            active.extend(jobs)
+        if legacy and (previous != str(ROOT) or not any("devices" not in cfg for _, cfg, _ in active)):
+            raise ValueError("旧版任务仍在登记资源，请稍后刷新。")
+        devices = set(request.get("devices") or [request.get("device")])
+        host, assigned = available_for_jobs(resources(), active)
+        for job_id, cfg, _ in active:
+            if (
+                request["kind"] == "setup"
+                or cfg["kind"] == "setup"
+                or any(assigned.get(d) == job_id for d in devices)
+            ):
+                raise ValueError(f"任务 {job_id} 正占用所选资源，请选择其他设备。")
+        if active and host["cpus"] < 1:
+            raise ValueError("运行中的任务已分配全部 LP 工作线程。")
+        config = validate(request, host)
+        if previous != str(ROOT):
+            slot.seek(0)
+            slot.truncate()
+            slot.write(str(ROOT))
+            slot.flush()
         key = uuid.uuid4().hex[:16]
         job = JOBS / key
         job.mkdir(mode=0o700)
@@ -629,12 +754,10 @@ def handle(request):
         state = reconcile(job_dir(latest)) if latest else {}
         action = request.get("action")
         if action == "start":
-            if latest and state["status"] not in FINAL:
-                raise ValueError(f"任务 {latest} 正在运行。")
-            return start_job(validate(request))
+            return start_job(request)
         selected = request.get("job") or latest
         if action == "stop":
-            if not request.get("job") or selected != latest or state.get("status") in FINAL:
+            if not request.get("job") or reconcile(job_dir(selected)).get("status") in FINAL:
                 raise ValueError("所选任务已结束或已被新任务替换。")
             (job_dir(selected) / "stop").touch()
             return {"id": selected}
@@ -643,8 +766,14 @@ def handle(request):
             s = read(job / "state.json")
             if (s["status"], s["kind"]) != ("completed", "infer"):
                 raise ValueError("请选择一次已完成的推理。")
+            config = job / "output/config.json"
             return dict(
-                layout=read(job / "output/best_policy_layout.json"), elapsed=s["ended"] - s["started"]
+                layout=read(job / "output/best_policy_layout.json"),
+                elapsed=s["ended"] - s["started"],
+                checkpoint=Path(read(job / "request.json").get("checkpoint", "")).name,
+                compatibility=read(config).get("slot_compatibility", "process-phase")
+                if config.exists()
+                else "footprint",
             )
         if action != "status":
             raise ValueError("未知操作。")
@@ -666,9 +795,11 @@ def handle(request):
                             seconds = sum(map(float, timing))
                             if seconds > 0:
                                 last_rate = round(60 * int(row["accepted"]) / seconds, 1)
-        view = read(job / "state.json") if job else {}
-        if view.get("kind") == "train":
+        view = reconcile(job) if job and job.name != latest else state if job else {}
+        if view and view["kind"] != "setup":
             config = read(job / "request.json")
+            view["devices"] = config.get("devices", [config["device"]])
+        if view.get("kind") == "train":
             view.update(batch=config["batch"], workers=config["workers"], layouts_per_minute=last_rate)
         if view.get("kind") == "train" and view["status"] == "running":
             cycles = config["cycles"]
@@ -680,11 +811,16 @@ def handle(request):
             else:
                 phase = "正在采样布局和求解终局 LP"
             view["detail"] = f"训练 PPO · 已完成 {done}/{cycles} 轮，{phase}"
+        host = resources()
+        available, assigned = available_for_jobs(host, active_jobs(ROOT))
         return dict(
             ready=READY.is_file(),
-            host=resources(),
+            host=host,
+            available=available,
+            assigned=assigned,
             latest=latest,
             jobs=[p.parent.name for p in history],
+            job_labels={p.parent.name: [s["kind"], s["status"]] for p in history if (s := read(p))},
             state=view,
             checkpoints=checkpoints(),
             curve=curve,
@@ -694,7 +830,9 @@ def handle(request):
 
 if __name__ == "__main__":
     os.umask(0o077)
-    if sys.argv[1:] and sys.argv[1] == "--work":
+    if sys.argv[1:2] == ["--rank"]:
+        run_rank(sys.argv[2], sys.argv[3:])
+    elif sys.argv[1:] and sys.argv[1] == "--work":
         execute(job_dir(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else None)
     else:
         try:

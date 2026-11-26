@@ -4,6 +4,8 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
+
 META = Path(__file__).resolve().parents[1] / "data/original_slot_instance/instance.json"
 
 
@@ -62,7 +64,7 @@ def result_package(reply):
             for p, d in meta["demands"].items()
         ],
     )
-    return dict(
+    package = dict(
         schema="fab-result-v1",
         method="rl",
         scenario=scene,
@@ -77,3 +79,33 @@ def result_package(reply):
             primal_infeasibility=residual,
         ),
     )
+    if "actions" in result:
+        actions = result["actions"]
+        with np.load(META.with_name("arrays.npz"), allow_pickle=False) as arrays:
+            order = arrays["order"].tolist()
+            classes = arrays["classes"].tolist()
+        if (
+            not isinstance(actions, list)
+            or any(type(slot) is not int for slot in actions)
+            or sorted(actions) != list(range(len(order)))
+            or [permutation[slot] for slot in actions] != order
+        ):
+            raise ValueError("实际放置动作与终局设备布局不一致。")
+        if reply.get("compatibility", "footprint") == "footprint":
+            classes = [(round(m["width"], 1), round(m["height"], 1)) for m in machines]
+        # The policy hands a class to the fixed fill rule once only one group remains.
+        remaining = {}
+        automatic = []
+        for step in reversed(range(len(order))):
+            machine = order[step]
+            groups = remaining.setdefault(classes[machine], set())
+            groups.add(machines[machine]["group"])
+            if len(groups) == 1:
+                automatic.append(step)
+        package["replay"] = dict(
+            slots=actions,
+            automatic_steps=automatic[::-1],
+            cycle=result.get("cycle"),
+            checkpoint=reply.get("checkpoint", ""),
+        )
+    return package

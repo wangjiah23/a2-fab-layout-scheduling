@@ -23,7 +23,17 @@ def isolated_worker(home):
     worker.READY = home / "deployed"
     worker.ACCOUNT_LOCK = Path(os.environ["A2_TEST_ACCOUNT"]) / "active.lock"
     worker.__file__ = __file__
-    worker.resources = lambda: dict(ram_free=8192, disk_free=16000, cpus=4, gpus=[], warning="")
+    worker.resources = lambda: dict(
+        ram_free=8192,
+        disk_free=16000,
+        cpus=4,
+        warning="",
+        gpus=[
+            dict(index=i, uuid=f"GPU-{i}", name="fixture", total=24000, free=22000, util="0")
+            for i in range(2)
+        ],
+    )
+
     if not Path("/proc/sys/kernel/random/boot_id").exists():
 
         def process_stamp(pid):
@@ -55,7 +65,7 @@ child.wait()
             str(home / "detached-child.pid"),
         ]
     if (home / "over-budget").exists():
-        worker.group_usage = lambda *_: (2048, 0)
+        worker.group_usage = lambda *_: (2048, {})
 
 
 class ConsoleTests(unittest.TestCase):
@@ -118,6 +128,106 @@ class ConsoleTests(unittest.TestCase):
             finally:
                 other.terminate()
                 other.wait()
+
+    def test_distinct_devices_overlap_and_jobs_stop_individually(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "deployed").touch()
+            env = {**os.environ, "A2_TEST_ACCOUNT": str(root / "locks"), "A2_TEST_WORKER_HOME": str(root)}
+
+            def rpc(action, **fields):
+                out = subprocess.check_output(
+                    [sys.executable, __file__, "--rpc"],
+                    input=json.dumps(dict(action=action, **fields)),
+                    text=True,
+                    env=env,
+                )
+                return json.loads(out)
+
+            def until(job, statuses):
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    state = rpc("status", job=job)["state"]["status"]
+                    if state in statuses:
+                        return state
+                    time.sleep(0.1)
+                self.fail(f"Job {job} stayed {state}")
+
+            params = dict(kind="train", cycles=1, batch=2, workers=1, ram_gib=2, vram_gib=2)
+            (root / "models").mkdir()
+            (root / "models/example.pt").touch()
+            a = rpc("start", **params, devices=["GPU-1"])["id"]
+            try:
+                b = rpc(
+                    "start", **{**params, "kind": "infer"}, checkpoint="models/example.pt", devices=["GPU-0"]
+                )["id"]
+                try:
+                    self.assertIn("error", rpc("start", **params, devices=["GPU-1", "GPU-0"]))
+                    self.assertEqual(until(b, {"running"}), "running")
+                    rpc("stop", job=a)
+                    self.assertEqual(until(a, {"stopped"}), "stopped")
+                    self.assertEqual(rpc("status", job=b)["state"]["status"], "running")
+                finally:
+                    rpc("stop", job=b)
+                    until(b, worker.FINAL)
+            finally:
+                rpc("stop", job=a)
+                until(a, worker.FINAL)
+
+    def test_multi_gpu_budgets_and_launcher(self):
+        cards = [dict(index=i, uuid=f"GPU-{i}", free=22000, total=24000) for i in range(2)]
+        host = dict(gpus=cards, cpus=24, idle_cpus=24, ram_free=96000)
+        req = dict(
+            kind="train", devices=["GPU-1", "GPU-0"], ram_gib=16, vram_gib=8, cycles=2, batch=8, workers=3
+        )
+        plan = worker.model_settings(req, host)
+        cmd = worker.model_command(plan, Path("/job/output"))
+        self.assertEqual(plan["devices"], ["GPU-1", "GPU-0"])
+        self.assertIn("--nproc-per-node=2", cmd)
+        self.assertIn("--run-path", cmd)
+        self.assertLess(cmd.index("--"), cmd.index("--run"))
+        self.assertEqual(cmd[cmd.index("--envs-per-rank") + 1], "4")
+        for bad in ({"kind": "infer"}, {"devices": ["GPU-0", "GPU-0"]}, {"batch": 3}, {"workers": 1}):
+            with self.assertRaises(ValueError):
+                worker.model_settings({**req, **bad}, host)
+
+    def test_rank_imports_the_deployed_package_and_splits_lp_workers(self):
+        import runpy
+
+        config = dict(
+            devices=["GPU-B", "GPU-A"],
+            device="GPU-B",
+            workers=3,
+            kind="train",
+            allocator_fractions=[0.4, 0.3],
+            fit_fractions=[0.6, 0.7],
+        )
+        torch = Mock()
+        seen = []
+
+        def record(module, run_name):
+            seen.append((module, list(sys.argv), sys.path[0]))
+
+        with (
+            patch.dict(sys.modules, torch=torch),
+            patch.dict(os.environ, LOCAL_RANK="1"),
+            patch.object(worker, "read", return_value=config),
+            patch.object(sys, "path", list(sys.path)),
+            patch.object(sys, "argv", []),
+            patch.object(runpy, "run_module", side_effect=record),
+        ):
+            worker.run_rank("request.json", ["--lp-workers", "3"])
+        self.assertEqual(
+            seen,
+            [
+                (
+                    "smat_rl.train",
+                    ["smat_rl.train", "--lp-workers", "1", "--gpu-memory-fraction", "0.7"],
+                    str(worker.CODE),
+                )
+            ],
+        )
+        torch.cuda.set_per_process_memory_fraction.assert_called_once_with(0.3, 1)
 
     def test_gpu_budgets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +378,8 @@ class ConsoleTests(unittest.TestCase):
             patch.object(worker, "capture", return_value=processes),
             patch.object(worker, "gpu_query", return_value=gpu_rows),
         ):
-            self.assertEqual(worker.group_usage(20, "GPU-A"), (6, 125))
+            self.assertEqual(worker.group_usage(20, ["GPU-A"]), (6, {"GPU-A": 125}))
+            self.assertEqual(worker.group_usage(20, ["GPU-A", "GPU-B"]), (6, {"GPU-A": 125, "GPU-B": 7}))
 
     def test_completed_job_survives_concurrent_status_read(self):
         finished = {"status": "completed"}
@@ -277,6 +388,19 @@ class ConsoleTests(unittest.TestCase):
             patch.object(worker, "active_identity", return_value=False),
         ):
             self.assertEqual(worker.reconcile(Path("job")), finished)
+
+    def test_orphan_rank_must_belong_to_this_job(self):
+        with (
+            patch.object(worker, "active_identity", return_value=False),
+            patch.object(worker, "capture", return_value="51 50\n61 60"),
+            patch.object(Path, "read_bytes", autospec=True, return_value=b"A2_FAB_JOB=/jobs/a\0") as environ,
+        ):
+            self.assertTrue(worker.owns_child_group(Path("/jobs/a"), [50, "old"]))
+            self.assertFalse(worker.owns_child_group(Path("/jobs/b"), [50, "old"]))
+            self.assertFalse(worker.owns_child_group(Path("/jobs/a"), [70, "old"]))
+            self.assertEqual(
+                [call.args[0] for call in environ.call_args_list], [Path("/proc/51/environ")] * 2
+            )
 
     def test_result_contract(self):
         meta = json.loads(results.META.read_text())
@@ -294,6 +418,14 @@ class ConsoleTests(unittest.TestCase):
 
         self.assertEqual(len(package()["layout"]), 1068)
         self.assertEqual(package()["metrics"]["moved"], 0)
+        self.assertNotIn("replay", package())
+        with results.np.load(results.META.with_name("arrays.npz"), allow_pickle=False) as arrays:
+            order = arrays["order"].tolist()
+        replay = package(actions=order)["replay"]
+        self.assertEqual(replay["slots"], order)
+        self.assertEqual(len(replay["automatic_steps"]), 161)
+        with self.assertRaises(ValueError):
+            package(actions=order[::-1])
         for change in (
             {"device_at_slot": [0] * len(device)},
             {"global_relative_gap_bound": 0.1},

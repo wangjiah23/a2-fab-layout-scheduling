@@ -1,4 +1,4 @@
-"""Serve the team's layout workbench at / and its local SSH console at /rl/."""
+"""Serve the team's layout workbench with its embedded local SSH console."""
 
 import os
 
@@ -102,7 +102,7 @@ def start_setup(key, progress=gr.Progress()):
 def model_fields(kind, device, ram, vram, workers, cycles, batch, checkpoint=None):
     fields = dict(
         kind=kind,
-        device=device,
+        devices=device if isinstance(device, list) else [device],
         ram_gib=whole_number(ram, "内存预算"),
         vram_gib=whole_number(vram, "显存预算"),
         workers=whole_number(workers, "并行 LP 数"),
@@ -116,7 +116,8 @@ def model_fields(kind, device, ram, vram, workers, cycles, batch, checkpoint=Non
 
 def start_model(key, kind, device, ram, vram, workers, cycles, batch, checkpoint):
     result = require_session(key).call(
-        "start", **model_fields(kind, device, ram, vram, workers, cycles, batch, checkpoint)
+        "start",
+        **model_fields(kind, device, ram, vram, workers if kind == "train" else 1, cycles, batch, checkpoint),
     )
     return gr.Dropdown(choices=[result["id"]], value=result["id"])
 
@@ -137,7 +138,8 @@ def bundle_link(session, key, directory):
         pct = (1 - m["optimized_cost"] / m["reference_cost"]) * 100
         session.exports[key] = (
             f"**终局运输成本 {m['optimized_cost']:,.2f}　降幅 {pct:.2f}%**　"
-            f"[在工作台对照布局](/?rl_result={token})　[下载结果包](/rl-results/{token})"
+            f"[下载结果包](/rl-results/{token})",
+            token,
         )
     return session.exports[key]
 
@@ -152,13 +154,16 @@ def training_preview(host, device, ram, vram, workers, batch):
     except ValueError as error:
         return html.escape(str(error))
     label = f"按当前资源预计每轮 **{plan['batch']}** 个布局，**{plan['workers']}** 个并行 LP。"
+    world = len(plan["devices"])
+    if world > 1:
+        label += f" {world} 卡同步，每卡 {plan['batch'] // world} 个布局。"
     capacity = f"当前约 {host.get('idle_cpus', host['cpus'])}/{host['cpus']} 个 CPU 空闲"
     if "vram_mib" in plan:
-        capacity += f"，显存预算 {plan['vram_mib'] / 1024:.1f} GiB"
+        capacity += f"，每卡显存预算 {plan['vram_mib'] / 1024:.1f} GiB"
     return f"{label}{capacity}。启动时重新读取资源。"
 
 
-def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, batch):
+def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, batch, train_devices=None):
     if not key:
         return (
             gr.Dropdown(choices=[], value=None),
@@ -170,18 +175,34 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
             gr.update(value=curve_data(), visible=False),
             "",
             "",
+            gr.update(choices=[], value=[]),
+            "",
+            gr.update(visible=False),
         )
     session = require_session(key)
     data = session.call("status", job=selected)
     host, state = data["host"], data["state"]
     gpus = host["gpus"]
     devices = [(f"GPU {g['index']} · {g['name']}", g["uuid"]) for g in gpus] + [("CPU", "cpu")]
-    default_device = max(gpus, key=lambda g: g["free"])["uuid"] if gpus else "cpu"
+    assigned = data.get("assigned", {})
+    free_gpus = [g for g in gpus if g["uuid"] not in assigned]
+    default_device = max(free_gpus, key=lambda g: g["free"])["uuid"] if free_gpus else "cpu"
     selected_device = device if device in dict(devices).values() else default_device
+    available_devices = set(dict(devices).values())
+    training = [d for d in (train_devices or []) if d in available_devices]
+    if train_devices is None:
+        training = [default_device]
     policies = [(DEMO_LABEL if p == "demo" else p, p) for p in data["checkpoints"]]
     chosen = checkpoint if checkpoint in data["checkpoints"] else (policies[0][1] if policies else None)
     table = [
-        [g["index"], g["name"], f"{g['free'] / 1024:.1f} / {g['total'] / 1024:.1f}", g["util"]] for g in gpus
+        [
+            g["index"],
+            g["name"],
+            f"{g['free'] / 1024:.1f} / {g['total'] / 1024:.1f}",
+            g["util"],
+            assigned.get(g["uuid"], "—"),
+        ]
+        for g in gpus
     ]
     info = (
         "环境已就绪" if data["ready"] else "环境待部署"
@@ -192,22 +213,30 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
         info += "\n\n当前部署目录没有任务记录。"
         if session.recent_root and session.recent_root != session.root:
             info += "该账号在其他目录有任务，点击「查看最近任务」即可打开。"
-    preview = training_preview(host, selected_device, ram, vram, workers, batch)
-    link = ""
+    preview = (
+        training_preview(data.get("available", host), training, ram, vram, workers, batch)
+        if training
+        else "请选择训练设备。"
+    )
+    if any(d in assigned for d in training):
+        preview = "所选训练设备正由工作台任务使用。释放后可启动训练。"
+
+    link = token = ""
     if state:
         info += f"\n\n{KINDS[state['kind']]} · **{STATES[state['status']]}**　{html.escape(state['detail'])}"
+        if state.get("devices"):
+            labels = {key: label.split(" · ")[0] for label, key in devices}
+            info += "　" + "、".join(labels.get(d, d) for d in state["devices"])
         if state["kind"] == "train" and "batch" in state:
             info += f"　每轮 {state['batch']} 个布局，{state['workers']} 个并行 LP"
             if state.get("layouts_per_minute"):
                 info += f"　上一完整轮 {state['layouts_per_minute']:g} 个布局/分钟"
-            if state["status"] in {"queued", "running"}:
-                preview = ""
         if state["status"] == "running" and "rss" in state:
             info += f"　任务 RSS {state['rss'] / 1024:.2f} GiB　显存 {state['vram'] / 1024:.2f} GiB"
         if state["status"] in {"completed", "stopped", "failed"} and state.get("peak_vram"):
             info += f"　任务采样显存峰值 {state['peak_vram']:,} MiB"
         if (state["kind"], state["status"]) == ("infer", "completed"):
-            link = bundle_link(session, state["id"], directory)
+            link, token = bundle_link(session, state["id"], directory)
         if (state["kind"], state["status"]) == ("train", "completed"):
             info += f"　推理可选检查点 `{state['id']}/final`。"
     curve = data["curve"]
@@ -222,8 +251,16 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
     job = state.get("id")
     if job and job not in jobs:
         jobs = [job, *jobs]
+    job_labels = data.get("job_labels", {})
+    labels = []
+    for j in jobs:
+        title = j
+        if j in job_labels:
+            kind, status = job_labels[j]
+            title = f"{KINDS[kind]} · {STATES[status]} · {j}"
+        labels.append((title, j))
     return (
-        gr.Dropdown(choices=jobs, value=job),
+        gr.update(choices=labels, value=job),
         gr.Dropdown(choices=devices, value=selected_device),
         gr.Dropdown(choices=policies, value=chosen),
         info,
@@ -232,6 +269,9 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
         plot,
         link,
         preview,
+        gr.update(choices=devices, value=training),
+        token,
+        gr.update(visible=bool(token)),
     )
 
 
@@ -239,7 +279,6 @@ def build_panel(directory):
     with gr.Blocks(title="RL 远程运行 · 晶圆厂布局工作台", analytics_enabled=False) as panel:
         session = gr.State("", time_to_live=7200, delete_callback=disconnect)
         tick = gr.Timer(4, active=False)
-        gr.Markdown("[← 晶圆厂布局工作台](/)\n# RL 远程运行\nSMAT2022 LVHM_E · 全厂基准 · 1,068 台设备")
         with gr.Accordion("SSH 连接", open=True):
             with gr.Row():
                 host = gr.Textbox(label="服务器 IP 或主机名", placeholder="输入服务器地址", scale=2)
@@ -270,44 +309,74 @@ def build_panel(directory):
             refresh_btn = gr.Button("刷新状态")
         status = gr.Markdown("尚未连接。")
         resources = gr.Dataframe(
-            headers=["GPU", "型号", "可用 / 总显存（GiB）", "利用率（%）"],
+            headers=["GPU", "型号", "可用 / 总显存（GiB）", "利用率（%）", "占用任务"],
             interactive=False,
             label="服务器 GPU",
         )
-        with gr.Row():
-            device = gr.Dropdown(label="计算设备", choices=[], interactive=True)
-            vram = gr.Textbox(label="显存预算（GiB，0 自动）", value="0", max_lines=1)
-            ram = gr.Textbox(label="内存预算（GiB，0 自动）", value="0", max_lines=1)
-            workers = gr.Textbox(label="并行 LP 数（0 自动）", value="0", max_lines=1)
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### 推理")
-                checkpoint = gr.Dropdown(label="策略检查点", choices=[], interactive=True)
+        with gr.Tabs():
+            with gr.Tab("推理"):
+                with gr.Row():
+                    device = gr.Dropdown(label="推理设备", choices=[], interactive=True)
+                    checkpoint = gr.Dropdown(label="策略检查点", choices=[], interactive=True)
+                gr.Markdown("从空厂布局逐台放置设备。终局运输 LP 校验通过后，工作台自动打开这次推理的回放。")
                 infer = gr.Button("启动推理", variant="primary")
-            with gr.Column():
-                gr.Markdown("### 训练")
+            with gr.Tab("训练"):
+                train_devices = gr.Dropdown(
+                    label="训练设备（GPU 可多选）", multiselect=True, choices=[], interactive=True
+                )
                 with gr.Row():
                     cycles = gr.Textbox(label="训练轮数", value="10", max_lines=1)
-                    batch = gr.Textbox(label="每轮完整布局数（0 自动）", value="0", max_lines=1)
+                    batch = gr.Textbox(label="每轮总布局数（0 自动）", value="0", max_lines=1)
+                    workers = gr.Textbox(label="并行 LP 总数（0 自动）", value="0", max_lines=1)
                 preview = gr.Markdown()
                 train = gr.Button("启动训练", variant="primary")
+        with gr.Accordion("任务资源预算", open=False):
+            with gr.Row():
+                vram = gr.Textbox(label="每卡显存预算（GiB，0 自动）", value="0", max_lines=1)
+                ram = gr.Textbox(label="任务内存预算（GiB，0 自动）", value="0", max_lines=1)
         with gr.Row():
             job = gr.Dropdown(label="远程任务", choices=[], interactive=True, scale=3)
             latest = gr.Button("查看最近任务")
             halt = gr.Button("停止选中任务", variant="stop")
         gr.Markdown("关闭页面后训练继续。重新连接同一账号，或点击「查看最近任务」可查看进度和曲线。")
         results = gr.Markdown()
+        token = gr.Textbox(visible="hidden")
+        replay = gr.Button("查看本次推理回放", visible=False)
+
+        def notify_workbench(force):
+            return """(token) => {
+              if (token && window.parent !== window)
+                window.parent.postMessage({type:'fab-rl-result',token,force:%s}, location.origin);
+            }""" % ("true" if force else "false")
+
+        token.change(None, token, None, js=notify_workbench(False), queue=False, api_visibility="private")
+        replay.click(None, token, None, js=notify_workbench(True), queue=False, api_visibility="private")
         plot = gr.LinePlot(
             value=curve_data(), x=AXES[0], y=AXES[1], label="训练采样", height=200, visible=False
         )
-        log = gr.Textbox(label="任务日志", lines=9, max_lines=15, interactive=False, autoscroll=True)
-        view = [job, device, checkpoint, status, resources, log, plot, results, preview]
+        log = gr.Textbox(
+            label="任务日志", elem_id="rl-task-log", lines=7, max_lines=15, interactive=False, autoscroll=True
+        )
+        view = [
+            job,
+            device,
+            checkpoint,
+            status,
+            resources,
+            log,
+            plot,
+            results,
+            preview,
+            train_devices,
+            token,
+            replay,
+        ]
 
-        def render(key, j, d, p, r, v, w, b):
-            return refresh(key, j, d, p, directory, r, v, w, b)
+        def render(key, j, d, p, r, v, w, b, td):
+            return refresh(key, j, d, p, directory, r, v, w, b, td)
 
         settings = [ram, vram, workers, batch]
-        inputs = [session, job, device, checkpoint, *settings]
+        inputs = [session, job, device, checkpoint, *settings, train_devices]
         event = dict(
             concurrency_id="rl-ssh", concurrency_limit=1, api_visibility="private", show_progress="hidden"
         )
@@ -324,16 +393,21 @@ def build_panel(directory):
         )
 
         def first(key, r, v, w, b):
-            return render(key, None, None, None, r, v, w, b)
+            return render(key, None, None, None, r, v, w, b, None)
 
         connected.then(guarded(first), [session, *settings], view, **event)
 
-        def open_latest(key, d, p, r, v, w, b):
+        def open_latest(key, d, p, r, v, w, b, td):
             ssh = require_session(key)
             ssh.select_root()
-            return gr.update(value=str(ssh.root), interactive=False), *render(key, None, d, p, r, v, w, b)
+            return gr.update(value=str(ssh.root), interactive=False), *render(key, None, d, p, r, v, w, b, td)
 
-        latest.click(guarded(open_latest), [session, device, checkpoint, *settings], [root, *view], **event)
+        latest.click(
+            guarded(open_latest),
+            [session, device, checkpoint, *settings, train_devices],
+            [root, *view],
+            **event,
+        )
 
         def leave(key):
             disconnect(key)
@@ -351,7 +425,16 @@ def build_panel(directory):
             after(
                 button.click(
                     guarded(launch),
-                    [session, device, ram, vram, workers, cycles, batch, checkpoint],
+                    [
+                        session,
+                        train_devices if kind == "train" else device,
+                        ram,
+                        vram,
+                        workers,
+                        cycles,
+                        batch,
+                        checkpoint,
+                    ],
                     job,
                     **event,
                 )
@@ -359,10 +442,10 @@ def build_panel(directory):
         halt.click(guarded(stop), [session, job], status, **event)
         job.input(guarded(render), inputs, view, **event)
 
-        def poll(key, j, d, p, r, v, w, b):
+        def poll(key, j, d, p, r, v, w, b, td):
             try:
                 # A timer must not reactivate a connection that the user just closed.
-                return (*render(key, j, d, p, r, v, w, b), gr.skip(), gr.skip())
+                return (*render(key, j, d, p, r, v, w, b, td), gr.skip(), gr.skip())
             except Exception as error:
                 return (
                     *([gr.skip()] * len(view)),
@@ -396,6 +479,7 @@ def create_app():
     app = FastAPI(lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"])
 
+    @app.get("/rl/")
     @app.get("/")
     def workbench():
         return FileResponse(WORKBENCH, media_type="text/html")
@@ -414,13 +498,34 @@ def create_app():
     return gr.mount_gradio_app(
         app,
         build_panel(directory),
-        path="/rl",
+        path="/rl/panel",
         server_name="127.0.0.1",
         ssr_mode=False,
         run_history=False,
         enable_monitoring=False,
         footer_links=[],
-        css=".gradio-container{max-width:1100px!important;margin:auto} .gradio-container h1{font-weight:650}",
+        theme=gr.themes.Base(
+            primary_hue="emerald",
+            neutral_hue="slate",
+            radius_size="sm",
+            font=["Inter", "Microsoft YaHei", "PingFang SC", "sans-serif"],
+        ).set(
+            body_text_color="#152e31",
+            body_text_color_subdued="#536b70",
+            block_border_color="#d9e3e0",
+            block_shadow="none",
+            button_primary_background_fill="#126b58",
+            button_primary_text_color="#ffffff",
+            button_primary_background_fill_hover="#0e5748",
+            button_primary_border_color="#126b58",
+            button_secondary_background_fill="#f3f7f4",
+            button_secondary_border_color="#cbdad3",
+            input_background_fill="#ffffff",
+            input_border_color="#cbdad3",
+            block_background_fill="#ffffff",
+        ),
+        css=".gradio-container{max-width:none!important;min-height:0!important;padding:14px 18px!important}"
+        " footer{display:none!important} body{margin:0;background:white}",
     )
 
 

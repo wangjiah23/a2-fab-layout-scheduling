@@ -4,13 +4,11 @@ import csv
 import io
 import json
 import re
+import sys
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 from xml.etree import ElementTree as ET
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill
-from PIL import Image
 
 SRC = Path(__file__).resolve().parent
 APP = SRC.parent
@@ -70,6 +68,8 @@ def scenario_data(summary):
 
 
 def workbook(scenario,name):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
     b=Workbook(); s=b.active; s.title='产品需求';s.append(['产品编号','路线编号','需求量（lot）'])
     for r in scenario['demands']: s.append([r['part'],r['route'],r['demand_lots']])
     s2=b.create_sheet('新增路线');s2.append(['路线编号','工序序号','工序类型','设备族编号','单批用时（分钟）'])
@@ -85,6 +85,7 @@ def workbook(scenario,name):
 
 
 def rl_data():
+    from PIL import Image
     with ZipFile(ROOT/'期中汇报/A2_期中汇报.pptx') as ppt:
         tree=ET.fromstring(ppt.read('ppt/charts/chart1.xml'))
         ns={'c':'http://schemas.openxmlformats.org/drawingml/2006/chart'}
@@ -99,6 +100,21 @@ def rl_data():
             buf=io.BytesIO();im.save(buf,'WEBP',quality=83,method=3)
             frames.append({'frame':frame,'img':b64(buf.getvalue())})
     return dict(curve=curve,frames=frames,epoch=95,frameCount=g.n_frames)
+
+
+def render_html(data):
+    html=(SRC/'shell.html').read_text(encoding='utf-8')
+    vals={'STYLE':(SRC/'style.css').read_text(encoding='utf-8'),
+          'ZIP_LIB':(SRC/'jszip.min.js').read_text(encoding='utf-8'),
+          'DATA':data,
+          'MODEL':(SRC/'io.js').read_text(encoding='utf-8'),
+          'MAP':(SRC/'map.js').read_text(encoding='utf-8'),
+          'UI':'\n'.join((SRC/f).read_text(encoding='utf-8') for f in ['views.js','app.js'])}
+    for k,v in vals.items():html=html.replace('<!-- '+k+' -->',v)
+    out=APP/'晶圆厂布局工作台.html'
+    newline='\r\n' if out.is_file() and b'\r\n' in out.read_bytes()[:100] else '\n'
+    out.write_bytes(html.replace('\n',newline).encode('utf-8'))
+    return out
 
 
 def main():
@@ -132,15 +148,7 @@ def main():
                  aliases=group_alias,e3=dict(metrics=metrics,layout=layout),rl=rl_data(),
                  local=dict(summary=local['summary'],slots=local['slots'],html=b64(local_html.encode())),
                  rawCsv=b64(raw_layout))
-    html=(SRC/'shell.html').read_text(encoding='utf-8')
-    vals={'STYLE':(SRC/'style.css').read_text(encoding='utf-8'),
-          'ZIP_LIB':(SRC/'jszip.min.js').read_text(encoding='utf-8'),
-          'DATA':pack(archive).replace('<','\\u003c'),
-          'MODEL':(SRC/'io.js').read_text(encoding='utf-8'),
-          'MAP':(SRC/'map.js').read_text(encoding='utf-8'),
-          'UI':'\n'.join((SRC/f).read_text(encoding='utf-8') for f in ['views.js','app.js'])}
-    for k,v in vals.items():html=html.replace('<!-- '+k+' -->',v)
-    out=APP/'晶圆厂布局工作台.html';out.write_text(html,encoding='utf-8')
+    out=render_html(pack(archive).replace('<','\\u003c'))
     package=ROOT/'周报演示应用_离线版.zip'
     source_files=['app.js','build.py','io.js','JSZip-LICENSE.md','jszip.min.js','map.js','shell.html','style.css','views.js']
     examples=['01_基准生产场景.xlsx','02_产品配比变化.xlsx','03_启发式全厂布局.csv','04_启发式离线结果包.json']
@@ -152,4 +160,10 @@ def main():
 
 
 if __name__=='__main__':
-    main()
+    if sys.argv[1:] == ['--ui-only']:
+        existing=(APP/'晶圆厂布局工作台.html').read_text(encoding='utf-8')
+        data=re.search(r'<script id="archive" type="application/json">(.*?)</script>',existing,re.S)
+        if not data:raise ValueError('Embedded course archive missing')
+        render_html(data[1])
+    else:
+        main()
