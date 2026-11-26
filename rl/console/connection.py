@@ -41,6 +41,28 @@ def deployment_root(value, home):
     return root
 
 
+def recent_job_root(sftp, home):
+    # The account lock retains the last job's directory after it is released.
+    marker = PurePosixPath(home) / ".local/state/a2-fab-rl/active.lock"
+    try:
+        with sftp.open(str(marker), "rb") as f:
+            value = f.read(4097)
+        if len(value) > 4096:
+            return None
+        value = value.decode("utf-8").strip()
+        if not PurePosixPath(value).is_absolute():
+            return None
+        root = deployment_root(value, home)
+        with sftp.open(str(root / "latest.json"), "rb") as f:
+            job = json.loads(f.read(128))
+        if isinstance(job, str) and re.fullmatch(r"[0-9a-f]{16}", job):
+            if stat.S_ISREG(sftp.stat(str(root / "jobs" / job / "state.json")).st_mode):
+                return root
+    except (FileNotFoundError, NotADirectoryError, PermissionError, ValueError):
+        pass
+    return None
+
+
 def whole_number(value, label):
     if isinstance(value, float) and value.is_integer():
         value = int(value)
@@ -82,7 +104,7 @@ class VerifiedHost(paramiko.MissingHostKeyPolicy):
 
 
 class Connection:
-    def __init__(self, host, port, user, password, expected, root=DEFAULT_ROOT):
+    def __init__(self, host, port, user, password, expected, root=""):
         self.host, self.port = address(host, port)
         self.user = str(user or "").strip()
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", self.user):
@@ -105,20 +127,25 @@ class Connection:
                 look_for_keys=not password,
             )
             self.client.get_transport().set_keepalive(30)
-            contents = (HERE / "worker.py").read_bytes()
-            name = "worker-" + hashlib.sha256(contents).hexdigest() + ".py"
-            with self.client.open_sftp() as sftp:
-                sftp.get_channel().settimeout(30)
-                chosen = deployment_root(root, sftp.normalize("."))
-                for path in (*reversed(chosen.parents), chosen):
-                    self.mkdir(sftp, path)
-                self.root = PurePosixPath(sftp.normalize(str(chosen)))
-                self.worker = self.root / "helpers" / name
-                self.mkdir(sftp, self.worker.parent)
-                self.put(sftp, self.worker, contents, reuse=True)
+            self.select_root(root)
         except BaseException:
             self.close()
             raise
+
+    def select_root(self, value=""):
+        with self.client.open_sftp() as sftp:
+            sftp.get_channel().settimeout(30)
+            home = sftp.normalize(".")
+            recent = recent_job_root(sftp, home)
+            chosen = deployment_root(str(value or "").strip() or recent or getattr(self, "root", None), home)
+            for path in (*reversed(chosen.parents), chosen):
+                self.mkdir(sftp, path)
+            chosen = PurePosixPath(sftp.normalize(str(chosen)))
+            contents = (HERE / "worker.py").read_bytes()
+            worker = chosen / "helpers" / ("worker-" + hashlib.sha256(contents).hexdigest() + ".py")
+            self.mkdir(sftp, worker.parent)
+            self.put(sftp, worker, contents, reuse=True)
+        self.root, self.worker, self.recent_root = chosen, worker, recent
 
     @staticmethod
     def mkdir(sftp, path):

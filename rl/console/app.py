@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connection import DEFAULT_ROOT, Connection, inspect_key, whole_number
+from connection import Connection, inspect_key, whole_number
 from results import result_package
 from worker import model_settings
 
@@ -167,7 +167,7 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
             "尚未连接。",
             [],
             "",
-            curve_data(),
+            gr.update(value=curve_data(), visible=False),
             "",
             "",
         )
@@ -188,6 +188,10 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
     ) + f"　可用内存 {host['ram_free'] / 1024:.1f} GiB　可用磁盘 {host['disk_free'] / 1024:.1f} GiB"
     if host["warning"]:
         info += "　" + html.escape(host["warning"])
+    if not data["jobs"]:
+        info += "\n\n当前部署目录没有任务记录。"
+        if session.recent_root and session.recent_root != session.root:
+            info += "该账号在其他目录有任务，点击「查看最近任务」即可打开。"
     preview = training_preview(host, selected_device, ram, vram, workers, batch)
     link = ""
     if state:
@@ -207,10 +211,13 @@ def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, ba
         if (state["kind"], state["status"]) == ("train", "completed"):
             info += f"　推理可选检查点 `{state['id']}/final`。"
     curve = data["curve"]
+    if state.get("kind") == "train" and state["status"] in {"queued", "running"} and not curve:
+        info += "\n\n首轮训练结束后，这里会显示每轮的采样平均成本降幅。"
+    series = (state.get("id"), curve)
     plot = gr.skip()
-    if curve != getattr(session, "last_curve", None):
-        plot = curve_data(curve)
-        session.last_curve = curve
+    if series != getattr(session, "last_curve", None):
+        plot = gr.update(value=curve_data(curve), visible=bool(curve))
+        session.last_curve = series
     jobs = data["jobs"]
     job = state.get("id")
     if job and job not in jobs:
@@ -240,9 +247,9 @@ def build_panel(directory):
                 user = gr.Textbox(label="SSH 用户名")
             root = gr.Textbox(
                 label="远端部署目录",
-                value=DEFAULT_ROOT,
+                placeholder="自动打开该账号最近一次任务所在的目录",
                 max_lines=1,
-                info="代码、uv 环境、模型和作业保存在这里。可填绝对路径或 ~/ 路径，断开后可切换目录。",
+                info="留空自动找回最近的任务。也可指定绝对路径或 ~/ 路径。",
             )
             with gr.Row():
                 pin = gr.Textbox(
@@ -286,10 +293,13 @@ def build_panel(directory):
                 train = gr.Button("启动训练", variant="primary")
         with gr.Row():
             job = gr.Dropdown(label="远程任务", choices=[], interactive=True, scale=3)
+            latest = gr.Button("查看最近任务")
             halt = gr.Button("停止选中任务", variant="stop")
-        gr.Markdown("关闭页面或断开 SSH 后，远程任务继续运行。重新连接同一账号可查看进度。")
+        gr.Markdown("关闭页面后训练继续。重新连接同一账号，或点击「查看最近任务」可查看进度和曲线。")
         results = gr.Markdown()
-        plot = gr.LinePlot(value=curve_data(), x=AXES[0], y=AXES[1], label="训练采样", height=200)
+        plot = gr.LinePlot(
+            value=curve_data(), x=AXES[0], y=AXES[1], label="训练采样", height=200, visible=False
+        )
         log = gr.Textbox(label="任务日志", lines=9, max_lines=15, interactive=False, autoscroll=True)
         view = [job, device, checkpoint, status, resources, log, plot, results, preview]
 
@@ -317,6 +327,13 @@ def build_panel(directory):
             return render(key, None, None, None, r, v, w, b)
 
         connected.then(guarded(first), [session, *settings], view, **event)
+
+        def open_latest(key, d, p, r, v, w, b):
+            ssh = require_session(key)
+            ssh.select_root()
+            return gr.update(value=str(ssh.root), interactive=False), *render(key, None, d, p, r, v, w, b)
+
+        latest.click(guarded(open_latest), [session, device, checkpoint, *settings], [root, *view], **event)
 
         def leave(key):
             disconnect(key)

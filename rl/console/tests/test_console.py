@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -91,6 +92,8 @@ class ConsoleTests(unittest.TestCase):
             other_root = home / "另一个部署目录 with spaces"
             self.assertIn("error", rpc("start", root=other_root, kind="setup"))
             self.assertEqual(rpc("status", root=other_root)["jobs"], [])
+            self.assertEqual(rpc("status", job="a" * 16)["state"]["id"], job)
+            self.assertIn("error", rpc("stop", job="a" * 16))
             self.assertIn("error", rpc("stop", job=setup))
             other = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
@@ -217,6 +220,41 @@ class ConsoleTests(unittest.TestCase):
             self.assertEqual(loaded["checkpoint_path"]("models/cycle120.pt"), policy)
             with self.assertRaises(ValueError):
                 loaded["checkpoint_path"]("../models/cycle120.pt")
+
+    def test_blank_login_and_explicit_switch_find_existing_job_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp).resolve()
+            custom = home / "course work"
+            default = home / ".local/share/a2-fab-rl"
+            marker = home / ".local/state/a2-fab-rl/active.lock"
+            sftp = Mock()
+            sftp.open.side_effect = open
+            sftp.stat.side_effect = os.stat
+            sftp.mkdir.side_effect = os.mkdir
+            sftp.normalize.side_effect = lambda p: str(home) if p == "." else str(Path(p).resolve())
+            session = connection.Connection.__new__(connection.Connection)
+            session.client = Mock()
+            session.client.open_sftp.return_value = nullcontext(sftp)
+            with patch.object(session, "put"):
+                session.select_root()
+                self.assertEqual(session.root, default)
+                marker.parent.mkdir(parents=True)
+                marker.write_text(str(custom))
+                self.assertIsNone(connection.recent_job_root(sftp, home))
+                self.assertFalse(custom.exists())
+                key = "0123456789abcdef"
+                job = custom / "jobs" / key
+                job.mkdir(parents=True)
+                (job / "state.json").write_text("{}")
+                (custom / "latest.json").write_text(json.dumps(key))
+                session.select_root(str(default))
+                self.assertEqual(session.root, default)
+                self.assertEqual(session.recent_root, custom)
+                session.select_root("  ")
+                self.assertEqual(session.root, custom)
+                self.assertEqual(session.worker.parent, custom / "helpers")
+                (custom / "latest.json").write_text('"../../wrong"')
+                self.assertIsNone(connection.recent_job_root(sftp, home))
 
     def test_counts_only_owned_processes_on_selected_gpu(self):
         processes = "20 20 2048\n21 20 4096\n22 22 9216"

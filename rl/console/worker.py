@@ -648,7 +648,11 @@ def handle(request):
             )
         if action != "status":
             raise ValueError("未知操作。")
-        job = job_dir(selected) if selected else None
+        # A refresh queued in the browser can still carry a job from the previous directory.
+        try:
+            job = job_dir(selected) if selected else None
+        except ValueError:
+            job = job_dir(latest) if latest else None
         history = sorted(JOBS.glob("*/state.json"), key=lambda p: p.parent.stat().st_ctime, reverse=True)[:50]
         curve = []
         last_rate = None
