@@ -23,6 +23,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from connection import DEFAULT_ROOT, Connection, inspect_key, whole_number
 from results import result_package
+from worker import model_settings
 
 WORKBENCH = Path(__file__).resolve().parents[2] / "sample_app/周报演示应用/晶圆厂布局工作台.html"
 SESSIONS = {}
@@ -98,7 +99,7 @@ def start_setup(key, progress=gr.Progress()):
     return gr.Dropdown(choices=[result["id"]], value=result["id"])
 
 
-def start_model(key, kind, device, ram, vram, workers, cycles, batch, checkpoint):
+def model_fields(kind, device, ram, vram, workers, cycles, batch, checkpoint=None):
     fields = dict(
         kind=kind,
         device=device,
@@ -110,7 +111,13 @@ def start_model(key, kind, device, ram, vram, workers, cycles, batch, checkpoint
         fields.update(cycles=whole_number(cycles, "训练轮数"), batch=whole_number(batch, "每轮布局数"))
     else:
         fields["checkpoint"] = checkpoint
-    result = require_session(key).call("start", **fields)
+    return fields
+
+
+def start_model(key, kind, device, ram, vram, workers, cycles, batch, checkpoint):
+    result = require_session(key).call(
+        "start", **model_fields(kind, device, ram, vram, workers, cycles, batch, checkpoint)
+    )
     return gr.Dropdown(choices=[result["id"]], value=result["id"])
 
 
@@ -139,7 +146,19 @@ def curve_data(rows=()):
     return pd.DataFrame(rows, columns=AXES).astype({AXES[0]: "int64", AXES[1]: "float64"})
 
 
-def refresh(key, selected, device, checkpoint, directory):
+def training_preview(host, device, ram, vram, workers, batch):
+    try:
+        plan = model_settings(model_fields("train", device, ram, vram, workers, 1, batch), host)
+    except ValueError as error:
+        return html.escape(str(error))
+    label = f"按当前资源预计每轮 **{plan['batch']}** 个布局，**{plan['workers']}** 个并行 LP。"
+    capacity = f"当前约 {host.get('idle_cpus', host['cpus'])}/{host['cpus']} 个 CPU 空闲"
+    if "vram_mib" in plan:
+        capacity += f"，显存预算 {plan['vram_mib'] / 1024:.1f} GiB"
+    return f"{label}{capacity}。启动时重新读取资源。"
+
+
+def refresh(key, selected, device, checkpoint, directory, ram, vram, workers, batch):
     if not key:
         return (
             gr.Dropdown(choices=[], value=None),
@@ -149,6 +168,7 @@ def refresh(key, selected, device, checkpoint, directory):
             [],
             "",
             curve_data(),
+            "",
             "",
         )
     session = require_session(key)
@@ -168,9 +188,16 @@ def refresh(key, selected, device, checkpoint, directory):
     ) + f"　可用内存 {host['ram_free'] / 1024:.1f} GiB　可用磁盘 {host['disk_free'] / 1024:.1f} GiB"
     if host["warning"]:
         info += "　" + html.escape(host["warning"])
+    preview = training_preview(host, selected_device, ram, vram, workers, batch)
     link = ""
     if state:
         info += f"\n\n{KINDS[state['kind']]} · **{STATES[state['status']]}**　{html.escape(state['detail'])}"
+        if state["kind"] == "train" and "batch" in state:
+            info += f"　每轮 {state['batch']} 个布局，{state['workers']} 个并行 LP"
+            if state.get("layouts_per_minute"):
+                info += f"　上一完整轮 {state['layouts_per_minute']:g} 个布局/分钟"
+            if state["status"] in {"queued", "running"}:
+                preview = ""
         if state["status"] == "running" and "rss" in state:
             info += f"　任务 RSS {state['rss'] / 1024:.2f} GiB　显存 {state['vram'] / 1024:.2f} GiB"
         if state["status"] in {"completed", "stopped", "failed"} and state.get("peak_vram"):
@@ -197,6 +224,7 @@ def refresh(key, selected, device, checkpoint, directory):
         data["log"],
         plot,
         link,
+        preview,
     )
 
 
@@ -253,7 +281,8 @@ def build_panel(directory):
                 gr.Markdown("### 训练")
                 with gr.Row():
                     cycles = gr.Textbox(label="训练轮数", value="10", max_lines=1)
-                    batch = gr.Textbox(label="每轮完整布局数", value="8", max_lines=1)
+                    batch = gr.Textbox(label="每轮完整布局数（0 自动）", value="0", max_lines=1)
+                preview = gr.Markdown()
                 train = gr.Button("启动训练", variant="primary")
         with gr.Row():
             job = gr.Dropdown(label="远程任务", choices=[], interactive=True, scale=3)
@@ -262,12 +291,13 @@ def build_panel(directory):
         results = gr.Markdown()
         plot = gr.LinePlot(value=curve_data(), x=AXES[0], y=AXES[1], label="训练采样", height=200)
         log = gr.Textbox(label="任务日志", lines=9, max_lines=15, interactive=False, autoscroll=True)
-        view = [job, device, checkpoint, status, resources, log, plot, results]
+        view = [job, device, checkpoint, status, resources, log, plot, results, preview]
 
-        def render(key, j, d, p):
-            return refresh(key, j, d, p, directory)
+        def render(key, j, d, p, r, v, w, b):
+            return refresh(key, j, d, p, directory, r, v, w, b)
 
-        inputs = [session, job, device, checkpoint]
+        settings = [ram, vram, workers, batch]
+        inputs = [session, job, device, checkpoint, *settings]
         event = dict(
             concurrency_id="rl-ssh", concurrency_limit=1, api_visibility="private", show_progress="hidden"
         )
@@ -283,17 +313,17 @@ def build_panel(directory):
             **event,
         )
 
-        def first(key):
-            return refresh(key, None, None, None, directory)
+        def first(key, r, v, w, b):
+            return render(key, None, None, None, r, v, w, b)
 
-        connected.then(guarded(first), session, view, **event)
+        connected.then(guarded(first), [session, *settings], view, **event)
 
         def leave(key):
             disconnect(key)
             return "", "", "已断开 SSH。", gr.Timer(active=False), gr.update(interactive=True)
 
         logout.click(leave, session, [session, password, connection_status, tick, root], **event).then(
-            guarded(first), session, view, **event
+            guarded(first), [session, *settings], view, **event
         )
         after(deploy.click(guarded(start_setup), session, job, **{**event, "show_progress": "full"}))
         for button, kind in ((infer, "infer"), (train, "train")):
@@ -312,10 +342,10 @@ def build_panel(directory):
         halt.click(guarded(stop), [session, job], status, **event)
         job.input(guarded(render), inputs, view, **event)
 
-        def poll(key, j, d, p):
+        def poll(key, j, d, p, r, v, w, b):
             try:
                 # A timer must not reactivate a connection that the user just closed.
-                return (*render(key, j, d, p), gr.skip(), gr.skip())
+                return (*render(key, j, d, p, r, v, w, b), gr.skip(), gr.skip())
             except Exception as error:
                 return (
                     *([gr.skip()] * len(view)),

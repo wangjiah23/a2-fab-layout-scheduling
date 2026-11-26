@@ -44,17 +44,65 @@ def capture(argv, timeout=8):
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=True).stdout.strip()
 
 
-def mem_available():
+def cgroup_dirs():
+    root = Path("/sys/fs/cgroup")
+    group = next(
+        (s[3:] for s in Path("/proc/self/cgroup").read_text().splitlines() if s.startswith("0::")), ""
+    )
+    relative = Path(group.lstrip("/"))
+    if ".." in relative.parts:
+        return [root]
+    return [root / parent for parent in (relative, *relative.parents)]
+
+
+def mem_available(groups):
     values = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
     available = int(values["MemAvailable"].split()[0]) // 1024
     # Account for a lower cgroup-v2 limit on shared servers.
-    cg = next((s[3:] for s in Path("/proc/self/cgroup").read_text().splitlines() if s.startswith("0::")), "")
-    base = Path("/sys/fs/cgroup") / cg.lstrip("/")
-    for parent in (base, *base.parents):
+    for parent in groups:
         cap = parent / "memory.max"
         if cap.is_file() and (raw := cap.read_text().strip()) != "max":
             available = min(available, (int(raw) - int((parent / "memory.current").read_text())) // MIB)
     return max(0, available)
+
+
+def cpu_ticks(affinity):
+    idle = total = 0
+    for row in Path("/proc/stat").read_text().splitlines():
+        label, *fields = row.split()
+        if label.startswith("cpu") and label[3:].isdigit() and int(label[3:]) in affinity:
+            ticks = list(map(int, fields[:8]))  # Guest time is already included in user time.
+            idle += ticks[3]
+            total += sum(ticks)
+    return idle, total
+
+
+def cpu_capacity(groups):
+    affinity = os.sched_getaffinity(0)
+    capacity = len(affinity)
+    quotas = {}
+    for parent in groups:
+        path = parent / "cpu.max"
+        if path.is_file():
+            quota, period = path.read_text().split()
+            if quota != "max":
+                cores = int(quota) / int(period)
+                capacity = min(capacity, max(1, math.floor(cores)))
+                quotas[parent / "cpu.stat"] = cores
+
+    def usage(path):
+        return int(dict(row.split() for row in path.read_text().splitlines())["usage_usec"])
+
+    before_usage = {path: usage(path) for path in quotas}
+    started = time.monotonic()
+    before_idle, before_total = cpu_ticks(affinity)
+    time.sleep(0.12)
+    idle, total = cpu_ticks(affinity)
+    free = len(affinity) * (idle - before_idle) / max(1, total - before_total)
+    elapsed_us = (time.monotonic() - started) * 1e6
+    for path, cores in quotas.items():
+        free = min(free, cores - (usage(path) - before_usage[path]) / max(1, elapsed_us))
+    return capacity, max(1, min(capacity, round(free)))
 
 
 def gpu_query(kind, fields):
@@ -75,11 +123,14 @@ def resources():
             )
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         warning = f"nvidia-smi: {exc}"
+    groups = cgroup_dirs()
+    cpus, idle_cpus = cpu_capacity(groups)
     return dict(
         gpus=gpus,
-        ram_free=mem_available(),
+        ram_free=mem_available(groups),
         disk_free=shutil.disk_usage(ROOT).free // MIB,
-        cpus=len(os.sched_getaffinity(0)),
+        cpus=cpus,
+        idle_cpus=idle_cpus,
         warning=warning,
     )
 
@@ -182,13 +233,8 @@ def checkpoint_path(choice):
     return job_dir(key) / "output" / (name + ".pt")
 
 
-def validate(args):
+def model_settings(args, host):
     kind = args.get("kind")
-    if kind == "setup":
-        return {"kind": kind}
-    if kind not in ("train", "infer") or not READY.is_file():
-        raise ValueError("请先完成环境部署。")
-    host = resources()
     cpu = args.get("device") == "cpu"
     gpu = next((g for g in host["gpus"] if g["uuid"] == args.get("device")), None)
     if not cpu and not gpu:
@@ -198,12 +244,12 @@ def validate(args):
     if available <= 0 or ram > available:
         raise ValueError(f"当前只有 {available} MiB 可用内存。")
     gpu_limit = integer(args, "vram_gib", 0, 256) * 1024
+    workers = integer(args, "workers", 0, min(host["cpus"], 64))
     budget = dict(
         kind=kind,
         device=args["device"],
         ram_mib=ram or max(1, int(available * 0.8)),
-        workers=integer(args, "workers", 0, min(host["cpus"], 64))
-        or min(host["cpus"], 2 if kind == "train" else 1),
+        workers=workers or 1,
     )
     if gpu:
         capacity = min(gpu["free"] - 512, int(0.96 * gpu["total"]))
@@ -216,10 +262,42 @@ def validate(args):
             fit_fraction=min(0.99, (gpu["total"] - gpu["free"] + limit) / gpu["total"]),
         )
     if kind == "train":
-        budget.update(cycles=integer(args, "cycles", 1, 10000), batch=integer(args, "batch", 2, 256))
-    else:
-        budget["checkpoint"] = str(checkpoint_path(args.get("checkpoint")))
+        batch = integer(args, "batch", 0, 256)
+        if batch == 1:
+            raise ValueError("每轮完整布局数可填 0 自动，或填 2 到 256。")
+        idle = host.get("idle_cpus", host["cpus"])
+        # The LP master uses one CPU thread per solve. Allow for the policy,
+        # CUDA pricing and the base process before budgeting solver copies.
+        lp_slots = min(64, max(1, idle - max(1, idle // 12)), max(1, (budget["ram_mib"] - 1792) // 256))
+        if not batch:
+            if gpu:
+                # Leave headroom over measured full-factory E3 peaks for 8–64 layouts.
+                tiers = ((4, 2048), (8, 3584), (16, 5632), (32, 9728), (64, 18432))
+                cap = max((n for n, mib in tiers if budget["vram_mib"] >= mib), default=2)
+            else:
+                cap = 8
+            cap = min(cap, 4 * min(workers or lp_slots, lp_slots))
+            batch = 1 << (cap.bit_length() - 1)
+        budget.update(
+            cycles=integer(args, "cycles", 1, 10000),
+            batch=batch,
+            workers=workers or min(batch, lp_slots),
+            auto_batch=args["batch"] == 0,
+            auto_workers=workers == 0,
+        )
     return budget
+
+
+def validate(args):
+    kind = args.get("kind")
+    if kind == "setup":
+        return {"kind": kind}
+    if kind not in ("train", "infer") or not READY.is_file():
+        raise ValueError("请先完成环境部署。")
+    settings = model_settings(args, resources())
+    if kind == "infer":
+        settings["checkpoint"] = str(checkpoint_path(args.get("checkpoint")))
+    return settings
 
 
 def setup_steps():
@@ -401,6 +479,8 @@ def execute(job, account_fd=None):
             "LD_LIBRARY_PATH": os.pathsep.join(cuda_libs),
         }
         setup = options["kind"] == "setup"
+        if options["kind"] == "train":
+            print(f"每轮 {options['batch']} 个完整布局，{options['workers']} 个并行 LP", flush=True)
         if setup:
             gpus = resources()["gpus"]
             if gpus:
@@ -571,14 +651,23 @@ def handle(request):
         job = job_dir(selected) if selected else None
         history = sorted(JOBS.glob("*/state.json"), key=lambda p: p.parent.stat().st_ctime, reverse=True)[:50]
         curve = []
+        last_rate = None
         if job and (metrics := job / "output/metrics.csv").is_file():
             with metrics.open() as f:
                 for row in csv.DictReader(f):
                     if row.get("mean_return"):
                         curve.append([int(row["cycle"]), round(100 * float(row["mean_return"]), 4)])
+                        timing = [row.get(k) for k in ("rollout_seconds", "lp_seconds", "update_seconds")]
+                        if row.get("accepted") and all(timing):
+                            seconds = sum(map(float, timing))
+                            if seconds > 0:
+                                last_rate = round(60 * int(row["accepted"]) / seconds, 1)
         view = read(job / "state.json") if job else {}
+        if view.get("kind") == "train":
+            config = read(job / "request.json")
+            view.update(batch=config["batch"], workers=config["workers"], layouts_per_minute=last_rate)
         if view.get("kind") == "train" and view["status"] == "running":
-            cycles = read(job / "request.json")["cycles"]
+            cycles = config["cycles"]
             done = curve[-1][0] if curve else 0
             if done >= cycles:
                 phase = "正在保存检查点"

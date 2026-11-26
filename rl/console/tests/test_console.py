@@ -141,6 +141,44 @@ class ConsoleTests(unittest.TestCase):
                 connection.VerifiedHost(pin).missing_host_key(None, "localhost", key)
         connection.VerifiedHost(connection.fingerprint(key)).missing_host_key(None, "localhost", key)
 
+    def test_auto_training_respects_current_resources_and_manual_fields(self):
+        gpu = dict(index=1, uuid="GPU-test", total=24564, free=24066)
+        host = dict(gpus=[gpu], ram_free=120 * 1024, cpus=24, idle_cpus=24)
+        req = dict(kind="train", device=gpu["uuid"], ram_gib=0, vram_gib=0, workers=0, cycles=2, batch=0)
+
+        def shape(snapshot=host, **fields):
+            chosen = worker.model_settings({**req, **fields}, snapshot)
+            return chosen["batch"], chosen["workers"]
+
+        self.assertEqual(shape(), (64, 22))
+        self.assertEqual(shape({**host, "idle_cpus": 5}), (16, 4))
+        self.assertEqual(shape(vram_gib=6), (16, 16))
+        self.assertEqual(shape(ram_gib=3), (16, 5))
+        self.assertEqual(shape(batch=3), (3, 3))
+        self.assertEqual(shape(workers=2), (8, 2))
+        self.assertEqual(shape(batch=75, workers=7), (75, 7))
+        self.assertEqual(shape(device="cpu"), (8, 8))
+        self.assertEqual(worker.model_settings({**req, "kind": "infer"}, host)["workers"], 1)
+        with self.assertRaises(ValueError):
+            shape(batch=1)
+
+    def test_cpu_budget_combines_affinity_idle_and_parent_quota(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            (parent / "cpu.max").write_text("450000 100000")
+            (parent / "cpu.stat").write_text("usage_usec 10000\n")
+
+            def busy(_):
+                (parent / "cpu.stat").write_text("usage_usec 310000\n")
+
+            with (
+                patch.object(os, "sched_getaffinity", return_value=set(range(16)), create=True),
+                patch.object(worker, "cpu_ticks", side_effect=[(0, 0), (95, 100)]),
+                patch.object(time, "sleep", side_effect=busy),
+                patch.object(time, "monotonic", side_effect=[0, 0.1]),
+            ):
+                self.assertEqual(worker.cpu_capacity([parent]), (4, 2))
+
     def test_form_integers(self):
         self.assertEqual(connection.address("127.0.0.1", " 2202 "), ("127.0.0.1", 2202))
         self.assertEqual(connection.whole_number("0", "内存预算"), 0)
