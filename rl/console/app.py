@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connection import Connection, inspect_key
+from connection import Connection, inspect_key, whole_number
 from results import result_package
 
 WORKBENCH = Path(__file__).resolve().parents[2] / "sample_app/周报演示应用/晶圆厂布局工作台.html"
@@ -88,13 +88,14 @@ def start_model(key, kind, device, ram, vram, workers, cycles, batch, checkpoint
     fields = dict(
         kind=kind,
         device=device,
-        ram_gib=ram,
-        vram_gib=vram,
-        workers=workers,
-        cycles=cycles,
-        batch=batch,
-        checkpoint=checkpoint,
+        ram_gib=whole_number(ram, "内存预算"),
+        vram_gib=whole_number(vram, "显存预算"),
+        workers=whole_number(workers, "并行 LP 数"),
     )
+    if kind == "train":
+        fields.update(cycles=whole_number(cycles, "训练轮数"), batch=whole_number(batch, "每轮布局数"))
+    else:
+        fields["checkpoint"] = checkpoint
     result = require_session(key).call("start", **fields)
     return gr.Dropdown(choices=[result["id"]], value=result["id"])
 
@@ -120,19 +121,22 @@ def bundle_link(session, key, directory):
     return session.exports[key]
 
 
+def curve_data(rows=()):
+    return pd.DataFrame(rows, columns=AXES).astype({AXES[0]: "int64", AXES[1]: "float64"})
+
+
 def refresh(key, selected, device, checkpoint, directory):
-    empty = (
-        gr.Dropdown(choices=[], value=None),
-        gr.Dropdown(choices=[], value=None),
-        gr.Dropdown(choices=[], value=None),
-        "尚未连接。",
-        [],
-        "",
-        gr.LinePlot(visible=False),
-        "",
-    )
     if not key:
-        return empty
+        return (
+            gr.Dropdown(choices=[], value=None),
+            gr.Dropdown(choices=[], value=None),
+            gr.Dropdown(choices=[], value=None),
+            "尚未连接。",
+            [],
+            "",
+            curve_data(),
+            "",
+        )
     session = require_session(key)
     data = session.call("status", job=selected)
     host, state = data["host"], data["state"]
@@ -158,13 +162,12 @@ def refresh(key, selected, device, checkpoint, directory):
         if (state["kind"], state["status"]) == ("infer", "completed"):
             link = bundle_link(session, state["id"], directory)
         if (state["kind"], state["status"]) == ("train", "completed"):
-            info += f"　推理页可选检查点 `{state['id']}/final`。"
+            info += f"　推理可选检查点 `{state['id']}/final`。"
     curve = data["curve"]
-    plot = (
-        gr.LinePlot(value=pd.DataFrame(curve, columns=AXES), x=AXES[0], y=AXES[1], visible=True)
-        if curve
-        else gr.LinePlot(visible=False)
-    )
+    plot = gr.skip()
+    if curve != getattr(session, "last_curve", None):
+        plot = curve_data(curve)
+        session.last_curve = curve
     jobs = data["jobs"]
     job = state.get("id")
     if job and job not in jobs:
@@ -189,7 +192,7 @@ def build_panel(directory):
         with gr.Accordion("SSH 连接", open=True):
             with gr.Row():
                 host = gr.Textbox(label="服务器 IP 或主机名", placeholder="输入服务器地址", scale=2)
-                port = gr.Number(label="SSH 端口", value=2202, precision=0)
+                port = gr.Textbox(label="SSH 端口", value="2202", max_lines=1)
                 user = gr.Textbox(label="SSH 用户名")
             with gr.Row():
                 pin = gr.Textbox(
@@ -216,24 +219,26 @@ def build_panel(directory):
         )
         with gr.Row():
             device = gr.Dropdown(label="计算设备", choices=[], interactive=True)
-            vram = gr.Number(label="显存预算（GiB，0 自动）", value=0, precision=0)
-            ram = gr.Number(label="内存预算（GiB，0 自动）", value=0, precision=0)
-            workers = gr.Number(label="并行 LP 数（0 自动）", value=0, precision=0)
-        with gr.Tabs():
-            with gr.Tab("推理"):
+            vram = gr.Textbox(label="显存预算（GiB，0 自动）", value="0", max_lines=1)
+            ram = gr.Textbox(label="内存预算（GiB，0 自动）", value="0", max_lines=1)
+            workers = gr.Textbox(label="并行 LP 数（0 自动）", value="0", max_lines=1)
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 推理")
                 checkpoint = gr.Dropdown(label="策略检查点", choices=[], interactive=True)
                 infer = gr.Button("启动推理", variant="primary")
-            with gr.Tab("训练"):
+            with gr.Column():
+                gr.Markdown("### 训练")
                 with gr.Row():
-                    cycles = gr.Number(label="训练轮数", value=10, precision=0)
-                    batch = gr.Number(label="每轮完整布局数", value=8, precision=0)
+                    cycles = gr.Textbox(label="训练轮数", value="10", max_lines=1)
+                    batch = gr.Textbox(label="每轮完整布局数", value="8", max_lines=1)
                 train = gr.Button("启动训练", variant="primary")
         with gr.Row():
             job = gr.Dropdown(label="远程任务", choices=[], interactive=True, scale=3)
             halt = gr.Button("停止选中任务", variant="stop")
         gr.Markdown("关闭页面或断开 SSH 后，远程任务继续运行。重新连接同一账号可查看进度。")
         results = gr.Markdown()
-        plot = gr.LinePlot(x=AXES[0], y=AXES[1], label="训练采样", visible=False, height=200)
+        plot = gr.LinePlot(value=curve_data(), x=AXES[0], y=AXES[1], label="训练采样", height=200)
         log = gr.Textbox(label="任务日志", lines=9, max_lines=15, interactive=False, autoscroll=True)
         view = [job, device, checkpoint, status, resources, log, plot, results]
 

@@ -17,18 +17,23 @@ HERE = Path(__file__).resolve().parent
 REMOTE = PurePosixPath(".local/share/a2-fab-rl")
 
 
+def whole_number(value, label):
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    digits = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,6}", digits):
+        raise ValueError(f"{label}必须是非负整数。")
+    return int(digits)
+
+
 def address(host, port):
     host = str(host or "").strip().strip("[]")
     if not host or len(host) > 253 or not re.fullmatch(r"[a-zA-Z0-9.:_-]+", host):
         raise ValueError("请输入服务器 IP 或主机名。")
-    if (
-        isinstance(port, bool)
-        or not isinstance(port, (int, float))
-        or port != int(port)
-        or not 1 <= port <= 65535
-    ):
+    port = whole_number(port, "SSH 端口")
+    if not 1 <= port <= 65535:
         raise ValueError("SSH 端口必须是 1 到 65535 的整数。")
-    return host, int(port)
+    return host, port
 
 
 def fingerprint(key):

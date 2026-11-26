@@ -311,6 +311,8 @@ def model_command(options, out):
     ]
     if gpu:
         cmd += ["--gpu-memory-fraction", str(options["fit_fraction"]), "--gradient-batch", "4096"]
+    else:
+        cmd += ["--gradient-batch", "8"]
     return cmd
 
 
@@ -488,12 +490,23 @@ def handle(request):
                 for row in csv.DictReader(f):
                     if row.get("mean_return"):
                         curve.append([int(row["cycle"]), round(100 * float(row["mean_return"]), 4)])
+        view = read(job / "state.json") if job else {}
+        if view.get("kind") == "train" and view["status"] == "running":
+            cycles = read(job / "request.json")["cycles"]
+            done = curve[-1][0] if curve else 0
+            if done >= cycles:
+                phase = "正在保存检查点"
+            elif (job / f"output/trajectories_rank0_cycle{done + 1}.json").is_file():
+                phase = "本轮终局 LP 已返回，正在更新策略"
+            else:
+                phase = "正在采样布局和求解终局 LP"
+            view["detail"] = f"训练 PPO · 已完成 {done}/{cycles} 轮，{phase}"
         return dict(
             ready=READY.is_file(),
             host=resources(),
             latest=latest,
             jobs=[p.parent.name for p in history],
-            state=read(job / "state.json") if job else {},
+            state=view,
             checkpoints=checkpoints(),
             curve=curve,
             log=tail(job / "job.log") if job else "",

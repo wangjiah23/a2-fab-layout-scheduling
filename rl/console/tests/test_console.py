@@ -123,6 +123,13 @@ class ConsoleTests(unittest.TestCase):
                 connection.VerifiedHost(pin).missing_host_key(None, "localhost", key)
         connection.VerifiedHost(connection.fingerprint(key)).missing_host_key(None, "localhost", key)
 
+    def test_form_integers(self):
+        self.assertEqual(connection.address("127.0.0.1", " 2202 "), ("127.0.0.1", 2202))
+        self.assertEqual(connection.whole_number("0", "内存预算"), 0)
+        for bad in ("", "-1", "1.8", "0xff", True):
+            with self.assertRaises(ValueError):
+                connection.whole_number(bad, "训练轮数")
+
     def test_counts_only_owned_processes_on_selected_gpu(self):
         processes = "20 20 2048\n21 20 4096\n22 22 9216"
         gpu_rows = [
