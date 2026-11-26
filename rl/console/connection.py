@@ -6,15 +6,39 @@ import hashlib
 import hmac
 import io
 import json
+import posixpath
 import re
+import shlex
+import shutil
 import socket
+import stat
+import subprocess
 import uuid
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 
 import paramiko
 
+from worker import REV
+
 HERE = Path(__file__).resolve().parent
-REMOTE = PurePosixPath(".local/share/a2-fab-rl")
+DEFAULT_ROOT = "~/.local/share/a2-fab-rl"
+
+
+def deployment_root(value, home):
+    value = str(value or "").strip() or DEFAULT_ROOT
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("部署目录包含无效控制字符。")
+    if value == "~" or value == "$HOME":
+        value = home
+    elif value.startswith("~/") or value.startswith("$HOME/"):
+        value = posixpath.join(home, value.split("/", 1)[1].lstrip("/"))
+    elif value.startswith("~"):
+        raise ValueError("请使用当前账号的 ~/ 路径或绝对路径。")
+    root = PurePosixPath("/" + posixpath.normpath(posixpath.join(home, value)).lstrip("/"))
+    if root == PurePosixPath("/") or not root.is_absolute():
+        raise ValueError("请选择服务器上的项目目录。")
+    return root
 
 
 def whole_number(value, label):
@@ -58,14 +82,16 @@ class VerifiedHost(paramiko.MissingHostKeyPolicy):
 
 
 class Connection:
-    def __init__(self, host, port, user, password, expected):
+    def __init__(self, host, port, user, password, expected, root=DEFAULT_ROOT):
         self.host, self.port = address(host, port)
         self.user = str(user or "").strip()
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,64}", self.user):
             raise ValueError("请输入 SSH 用户名。")
         self.client = paramiko.SSHClient()
-        self.client.load_system_host_keys()
-        self.client.set_missing_host_key_policy(VerifiedHost(str(expected or "").strip()))
+        expected = str(expected or "").strip()
+        if not expected:
+            self.client.load_system_host_keys()
+        self.client.set_missing_host_key_policy(VerifiedHost(expected))
         try:
             self.client.connect(
                 self.host,
@@ -81,13 +107,14 @@ class Connection:
             self.client.get_transport().set_keepalive(30)
             contents = (HERE / "worker.py").read_bytes()
             name = "worker-" + hashlib.sha256(contents).hexdigest() + ".py"
-            self.worker = REMOTE / "helpers" / name
             with self.client.open_sftp() as sftp:
                 sftp.get_channel().settimeout(30)
-                path = PurePosixPath(".")
-                for part in (*REMOTE.parts, "helpers"):
-                    path /= part
+                chosen = deployment_root(root, sftp.normalize("."))
+                for path in (*reversed(chosen.parents), chosen):
                     self.mkdir(sftp, path)
+                self.root = PurePosixPath(sftp.normalize(str(chosen)))
+                self.worker = self.root / "helpers" / name
+                self.mkdir(sftp, self.worker.parent)
                 self.put(sftp, self.worker, contents, reuse=True)
         except BaseException:
             self.close()
@@ -96,12 +123,18 @@ class Connection:
     @staticmethod
     def mkdir(sftp, path):
         try:
-            sftp.stat(str(path))
+            info = sftp.stat(str(path))
         except FileNotFoundError:
             try:
                 sftp.mkdir(str(path), mode=0o700)
-            except OSError:
-                sftp.stat(str(path))  # Another connection may have created it.
+                return
+            except OSError as original:
+                try:
+                    info = sftp.stat(str(path))  # Another connection may have created it.
+                except OSError:
+                    raise OSError(f"无法创建远端目录 {path}。{original}") from original
+        if not stat.S_ISDIR(info.st_mode):
+            raise NotADirectoryError(f"远端路径已经是文件：{path}")
 
     @staticmethod
     def put(sftp, target, contents, callback=None, reuse=False):
@@ -127,8 +160,49 @@ class Connection:
             content = f.read()
         with self.client.open_sftp() as sftp:
             sftp.get_channel().settimeout(30)
-            self.mkdir(sftp, REMOTE / "models")
-            self.put(sftp, REMOTE / "models/demo.pt", content, callback)
+            self.mkdir(sftp, self.root / "models")
+            self.put(sftp, self.root / "models/demo.pt", content, callback)
+
+    def stage_release(self, callback=None):
+        # A normal local clone already contains the published revision. Its Git
+        # bundle lets a restricted GPU host verify and check out that same commit.
+        repo = HERE.parents[1]
+        if (
+            not shutil.which("git")
+            or subprocess.run(
+                ["git", "-C", str(repo), "cat-file", "-e", REV + "^{commit}"], capture_output=True
+            ).returncode
+        ):
+            return
+        target = self.root / "cache" / (REV + ".bundle")
+        with self.client.open_sftp() as sftp:
+            sftp.get_channel().settimeout(60)
+            self.mkdir(sftp, target.parent)
+            try:
+                sftp.stat(str(target))
+                return
+            except FileNotFoundError:
+                pass
+            with TemporaryDirectory(prefix="a2-rl-release-") as tmp:
+                bare = Path(tmp) / "git"
+                bundle = Path(tmp) / "release.bundle"
+                for cmd in (
+                    ["git", "init", "--bare", "--quiet", str(bare)],
+                    [
+                        "git",
+                        "-C",
+                        str(bare),
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        str(repo),
+                        REV + ":refs/heads/release",
+                    ],
+                    ["git", "-C", str(bare), "bundle", "create", str(bundle), "refs/heads/release"],
+                ):
+                    if subprocess.run(cmd, capture_output=True).returncode:
+                        return  # Shallow/package-only installs use the remote GitHub fetch.
+                self.put(sftp, target, bundle.read_bytes(), callback)
 
     def call(self, action, **options):
         transport = self.client.get_transport()
@@ -137,7 +211,7 @@ class Connection:
         with transport.open_session(timeout=15) as channel:
             channel.settimeout(30)
             channel.set_combine_stderr(True)
-            channel.exec_command(f'exec python3 "$HOME/{self.worker}"')
+            channel.exec_command(shlex.join(["exec", "python3", str(self.worker)]))
             channel.sendall(json.dumps(dict(action=action, **options)).encode())
             channel.shutdown_write()
             with channel.makefile("rb") as stream:

@@ -20,6 +20,7 @@ def isolated_worker(home):
     worker.JOBS = home / "jobs"
     worker.CODE = home / "code"
     worker.READY = home / "deployed"
+    worker.ACCOUNT_LOCK = Path(os.environ["A2_TEST_ACCOUNT"]) / "active.lock"
     worker.__file__ = __file__
     worker.resources = lambda: dict(ram_free=8192, disk_free=16000, cpus=4, gpus=[], warning="")
     if not Path("/proc/sys/kernel/random/boot_id").exists():
@@ -45,6 +46,13 @@ Path(sys.argv[1]).write_text(str(child.pid))
 child.wait()
 """
     worker.model_command = lambda *_: [sys.executable, "-c", payload, str(home / "child.pid")]
+    if (home / "launcher-exits").exists():
+        worker.model_command = lambda *_: [
+            sys.executable,
+            "-c",
+            payload.replace("child.wait()", ""),
+            str(home / "detached-child.pid"),
+        ]
     if (home / "over-budget").exists():
         worker.group_usage = lambda *_: (2048, 0)
 
@@ -53,14 +61,14 @@ class ConsoleTests(unittest.TestCase):
     def test_owned_job_lifecycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
-            env = {**os.environ, "A2_TEST_WORKER_HOME": tmp}
+            env = {**os.environ, "A2_TEST_ACCOUNT": str(home / "account-locks")}
 
-            def rpc(action, **fields):
+            def rpc(action, root=home, **fields):
                 reply = subprocess.check_output(
                     [sys.executable, __file__, "--rpc"],
                     input=json.dumps(dict(action=action, **fields)),
                     text=True,
-                    env=env,
+                    env={**env, "A2_TEST_WORKER_HOME": str(root)},
                 )
                 return json.loads(reply)
 
@@ -80,6 +88,9 @@ class ConsoleTests(unittest.TestCase):
             child = wait(lambda s: "rss" in s and (home / "child.pid").is_file())["state"]["child"][0]
             self.assertEqual(os.getpgid(int((home / "child.pid").read_text())), child)
             self.assertIn("error", rpc("start", **params))
+            other_root = home / "另一个部署目录 with spaces"
+            self.assertIn("error", rpc("start", root=other_root, kind="setup"))
+            self.assertEqual(rpc("status", root=other_root)["jobs"], [])
             self.assertIn("error", rpc("stop", job=setup))
             other = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True
@@ -94,6 +105,13 @@ class ConsoleTests(unittest.TestCase):
                 rpc("start", **params)
                 state = wait(lambda s: s["status"] == "failed")["state"]
                 self.assertIn("超过任务资源预算", state["detail"])
+                (home / "over-budget").unlink()
+                (home / "launcher-exits").touch()
+                rpc("start", **params)
+                wait(lambda s: s["status"] == "completed")
+                pid = int((home / "detached-child.pid").read_text())
+                status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True)
+                self.assertTrue(not status.stdout.strip() or status.stdout.strip().startswith("Z"))
             finally:
                 other.terminate()
                 other.wait()
@@ -129,6 +147,38 @@ class ConsoleTests(unittest.TestCase):
         for bad in ("", "-1", "1.8", "0xff", True):
             with self.assertRaises(ValueError):
                 connection.whole_number(bad, "训练轮数")
+
+    def test_remote_root_uses_server_home_and_keeps_literal_paths(self):
+        home = "/home/fab"
+        for raw, expected in [
+            ("", "/home/fab/.local/share/a2-fab-rl"),
+            ("~/PPO 试验", "/home/fab/PPO 试验"),
+            ("$HOME/projects", "/home/fab/projects"),
+            ("course/A2", "/home/fab/course/A2"),
+            ("/mnt/data/team's run", "/mnt/data/team's run"),
+        ]:
+            self.assertEqual(str(connection.deployment_root(raw, home)), expected)
+        for invalid in ("/", "~other/private", "/a\nb"):
+            with self.assertRaises(ValueError):
+                connection.deployment_root(invalid, home)
+
+    def test_uploaded_helper_and_models_follow_selected_root(self):
+        import runpy
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve() / "自选目录"
+            helpers = root / "helpers"
+            helpers.mkdir(parents=True)
+            script = helpers / "worker-test.py"
+            script.write_bytes(Path(worker.__file__).read_bytes())
+            loaded = runpy.run_path(str(script))
+            self.assertEqual(loaded["ROOT"], root)
+            (root / "models").mkdir()
+            policy = root / "models" / "cycle120.pt"
+            policy.touch()
+            self.assertEqual(loaded["checkpoint_path"]("models/cycle120.pt"), policy)
+            with self.assertRaises(ValueError):
+                loaded["checkpoint_path"]("../models/cycle120.pt")
 
     def test_counts_only_owned_processes_on_selected_gpu(self):
         processes = "20 20 2048\n21 20 4096\n22 22 9216"
@@ -180,7 +230,7 @@ class ConsoleTests(unittest.TestCase):
 if __name__ == "__main__" and os.environ.get("A2_TEST_WORKER_HOME") and len(sys.argv) > 1:
     isolated_worker(Path(os.environ["A2_TEST_WORKER_HOME"]))
     if sys.argv[1] == "--work":
-        worker.execute(worker.job_dir(sys.argv[2]))
+        worker.execute(worker.job_dir(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else None)
     elif sys.argv[1] == "--rpc":
         try:
             print(json.dumps(worker.handle(json.load(sys.stdin))))

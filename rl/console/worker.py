@@ -1,7 +1,7 @@
 """SSH entry point on the Linux GPU host. Only the Python standard library is needed."""
 
 import csv
-import fcntl
+import importlib.util
 import json
 import math
 import os
@@ -14,9 +14,13 @@ import time
 import uuid
 from pathlib import Path
 
-ROOT = Path.home() / ".local/share/a2-fab-rl"
+# SFTP installs this file under <selected root>/helpers/. Detached children
+# execute the same file, so a reconnect and a background run use the same root.
+ROOT = Path(__file__).resolve().parents[1]
+ACCOUNT_LOCK = Path.home() / ".local/state/a2-fab-rl/active.lock"
 REPO = "https://github.com/wangjiah23/a2-fab-layout-scheduling.git"
 REV = "b0d852ac722c55ef0baa2bdc471d77a7abd6ba92"
+PYTHON_VERSION = "3.11"
 CODE = ROOT / "releases" / REV / "rl"
 READY = CODE.parent / ".console-ready"
 JOBS = ROOT / "jobs"
@@ -159,14 +163,21 @@ def checkpoints():
     saved.extend(p for p in JOBS.glob("*/output/last_rank0.pt") if not (p.parent / "final.pt").exists())
     saved.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     items = [p.parents[1].name + "/" + p.stem for p in saved]
-    return items + ([DEMO] if (ROOT / "models/demo.pt").is_file() else [])
+    models = sorted(
+        "models/" + p.name
+        for p in (ROOT / "models").glob("*.pt")
+        if p.name != "demo.pt" and p.is_file() and not p.is_symlink()
+    )
+    return items + models + ([DEMO] if (ROOT / "models/demo.pt").is_file() else [])
 
 
 def checkpoint_path(choice):
     if choice not in checkpoints():
-        raise ValueError("请选择已安装的演示策略或本工作台产生的检查点。")
+        raise ValueError("请在当前部署目录的策略列表中选择检查点。")
     if choice == DEMO:
         return ROOT / "models/demo.pt"
+    if choice.startswith("models/"):
+        return ROOT / choice
     key, name = choice.split("/")
     return job_dir(key) / "output" / (name + ".pt")
 
@@ -217,21 +228,41 @@ def setup_steps():
     uv = str(ROOT / "bin/uv")
     python = str(CODE / ".venv/bin/python")
     if not os.access(uv, os.X_OK):
-        installer = str(ROOT / "install-uv.sh")
-        yield (
-            "下载 uv 0.10.2",
-            [
-                "curl",
-                "--fail",
-                "--location",
-                "--retry",
-                "2",
-                "--output",
-                installer,
-                "https://astral.sh/uv/0.10.2/install.sh",
-            ],
-        )
-        yield "安装用户级 uv", ["env", f"UV_UNMANAGED_INSTALL={ROOT / 'bin'}", "sh", installer]
+        if importlib.util.find_spec("pip"):
+            bootstrap = ROOT / "cache/uv-bootstrap"
+            yield (
+                "从 PyPI 下载 uv 0.10.2",
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--disable-pip-version-check",
+                    "--no-deps",
+                    "--only-binary=:all:",
+                    "--upgrade",
+                    "--target",
+                    str(bootstrap),
+                    "uv==0.10.2",
+                ],
+            )
+            yield "安装用户级 uv", ["install", "-D", "-m", "700", str(bootstrap / "bin/uv"), uv]
+        else:
+            installer = str(ROOT / "install-uv.sh")
+            yield (
+                "下载 uv 0.10.2",
+                [
+                    "curl",
+                    "--fail",
+                    "--location",
+                    "--retry",
+                    "2",
+                    "--output",
+                    installer,
+                    "https://astral.sh/uv/0.10.2/install.sh",
+                ],
+            )
+            yield "安装用户级 uv", ["env", f"UV_UNMANAGED_INSTALL={ROOT / 'bin'}", "sh", installer]
     if not (checkout / ".git").is_dir():
         yield "初始化代码目录", ["git", "init", "--quiet", str(checkout)]
     if (
@@ -240,14 +271,17 @@ def setup_steps():
             ["git", "-C", str(checkout), "cat-file", "-e", REV + "^{commit}"], capture_output=True
         ).returncode
     ):
-        yield (
-            "从 GitHub 下载 RL 代码和全厂数据",
-            ["git", "-C", str(checkout), "fetch", "--progress", "--depth=1", REPO, REV],
-        )
+        bundle = ROOT / "cache" / (REV + ".bundle")
+        fetch = ["git", "-C", str(checkout), "fetch", "--progress"]
+        if bundle.is_file():
+            yield "从已传入的 Git 提交包检出代码和全厂数据", [*fetch, str(bundle), "refs/heads/release"]
+        else:
+            yield "从 GitHub 下载 RL 代码和全厂数据", [*fetch, "--depth=1", REPO, REV]
     yield "检出 RL " + REV[:7], ["git", "-C", str(checkout), "checkout", "--quiet", "--detach", REV]
+    yield f"准备 Python {PYTHON_VERSION}", [uv, "python", "install", PYTHON_VERSION]
     yield (
         "按 uv.lock 安装 PyTorch、CuPy 和 LP 依赖",
-        [uv, "sync", "--project", str(CODE), "--locked", "--python", "3.11", "--extra", "cuda"],
+        [uv, "sync", "--project", str(CODE), "--locked", "--python", PYTHON_VERSION, "--extra", "cuda"],
     )
     yield (
         "验证模型、定价内核和 CUDA",
@@ -334,7 +368,7 @@ class Stopped(Exception):
     pass
 
 
-def execute(job):
+def execute(job, account_fd=None):
     options = read(job / "request.json")
     state = read(job / "state.json")
     proc = None
@@ -345,6 +379,12 @@ def execute(job):
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     try:
+        # CuPy loads NVRTC by soname. The locked CUDA wheels provide it even
+        # on driver-only hosts where the system linker has no CUDA search path.
+        nvidia = CODE / f".venv/lib/python{PYTHON_VERSION}/site-packages/nvidia"
+        cuda_libs = [str(nvidia / package / "lib") for package in ("cuda_nvrtc", "cuda_runtime")]
+        if os.environ.get("LD_LIBRARY_PATH"):
+            cuda_libs.append(os.environ["LD_LIBRARY_PATH"])
         env = {
             **os.environ,
             "PYTHONUNBUFFERED": "1",
@@ -352,9 +392,20 @@ def execute(job):
             "OMP_NUM_THREADS": "1",
             "MKL_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
+            "UV_CACHE_DIR": str(ROOT / "cache/uv"),
+            "UV_PYTHON_INSTALL_DIR": str(ROOT / "python"),
+            "UV_PROJECT_ENVIRONMENT": str(CODE / ".venv"),
+            "PIP_CACHE_DIR": str(ROOT / "cache/pip"),
+            "UV_PYTHON_BIN_DIR": str(ROOT / "bin"),
+            "CUPY_CACHE_DIR": str(ROOT / "cache/cupy"),
+            "LD_LIBRARY_PATH": os.pathsep.join(cuda_libs),
         }
         setup = options["kind"] == "setup"
-        if not setup:
+        if setup:
+            gpus = resources()["gpus"]
+            if gpus:
+                env["CUDA_VISIBLE_DEVICES"] = max(gpus, key=lambda g: g["free"])["uuid"]
+        else:
             for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE"):
                 env.pop(key, None)
             env["CUDA_VISIBLE_DEVICES"] = "" if options["device"] == "cpu" else options["device"]
@@ -384,6 +435,7 @@ def execute(job):
                 env=env,
                 cwd=CODE if CODE.is_dir() else ROOT,
                 start_new_session=True,
+                pass_fds=() if account_fd is None else (account_fd,),
             )
             state["child"] = [proc.pid, stamp(proc.pid)]
             save(job / "state.json", state)
@@ -392,7 +444,7 @@ def execute(job):
                     raise Stopped()
                 if not setup:
                     rss, vram = group_usage(proc.pid, options["device"])
-                    state.update(rss=rss, vram=vram)
+                    state.update(rss=rss, vram=vram, peak_vram=max(state.get("peak_vram", 0), vram))
                     save(job / "state.json", state)
                     if rss > options["ram_mib"] or vram > options.get("vram_mib", math.inf):
                         raise RuntimeError(f"超过任务资源预算，RSS {rss} MiB，显存 {vram} MiB")
@@ -401,6 +453,8 @@ def execute(job):
                 raise Stopped()
             if proc.returncode:
                 raise RuntimeError(f"{label} 退出码 {proc.returncode}，请查看日志。")
+            # A successful launcher may exit before its subprocesses release the GPU.
+            terminate_group(proc.pid, proc)
             state.pop("child", None)
             proc = None
         if setup:
@@ -422,6 +476,8 @@ def execute(job):
                 save(job / "state.json", state)
                 return
         state.pop("child", None)
+        if account_fd is not None:
+            os.close(account_fd)
         state.update(ended=time.time())
         save(job / "state.json", state)
 
@@ -434,7 +490,56 @@ def tail(path, size=12000):
         return f.read(size).decode(errors="replace").replace("\r", "\n")
 
 
+def start_job(config):
+    import fcntl
+
+    ACCOUNT_LOCK.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with ACCOUNT_LOCK.open("a+") as slot:
+        try:
+            fcntl.flock(slot, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            slot.seek(0)
+            raise ValueError(f"该账号已有任务运行，请连接其部署目录查看：{slot.read().strip()}") from None
+        # Older default-root workers predate the account-wide lock.
+        old_root = Path.home() / ".local/share/a2-fab-rl"
+        pointer = old_root / "latest.json"
+        if old_root.resolve() != ROOT and pointer.is_file():
+            old = old_root / "jobs" / read(pointer)
+            if (old / "state.json").is_file():
+                other = read(old / "state.json")
+                if other["status"] not in FINAL and (
+                    active_identity(read(old / "owner.json")) or active_identity(other.get("child"))
+                ):
+                    raise ValueError(f"该账号已有任务在 {old_root} 运行。")
+        slot.seek(0)
+        slot.truncate()
+        slot.write(str(ROOT))
+        slot.flush()
+        key = uuid.uuid4().hex[:16]
+        job = JOBS / key
+        job.mkdir(mode=0o700)
+        save(job / "request.json", config)
+        save(
+            job / "state.json",
+            dict(id=key, kind=config["kind"], status="queued", detail="已排队", started=time.time()),
+        )
+        with (job / "job.log").open("ab", buffering=0) as log:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--work", key, str(slot.fileno())],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+                pass_fds=(slot.fileno(),),
+            )
+        save(job / "owner.json", [proc.pid, stamp(proc.pid)])
+        save(ROOT / "latest.json", key)
+        return {"id": key}
+
+
 def handle(request):
+    import fcntl
+
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     JOBS.mkdir(mode=0o700, exist_ok=True)
     with (ROOT / "control.lock").open("a") as lock:
@@ -446,26 +551,7 @@ def handle(request):
         if action == "start":
             if latest and state["status"] not in FINAL:
                 raise ValueError(f"任务 {latest} 正在运行。")
-            config = validate(request)
-            key = uuid.uuid4().hex[:16]
-            job = JOBS / key
-            job.mkdir(mode=0o700)
-            save(job / "request.json", config)
-            save(
-                job / "state.json",
-                dict(id=key, kind=config["kind"], status="queued", detail="已排队", started=time.time()),
-            )
-            with (job / "job.log").open("ab", buffering=0) as log:
-                proc = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "--work", key],
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    start_new_session=True,
-                )
-            save(job / "owner.json", [proc.pid, stamp(proc.pid)])
-            save(pointer, key)
-            return {"id": key}
+            return start_job(validate(request))
         selected = request.get("job") or latest
         if action == "stop":
             if not request.get("job") or selected != latest or state.get("status") in FINAL:
@@ -516,7 +602,7 @@ def handle(request):
 if __name__ == "__main__":
     os.umask(0o077)
     if sys.argv[1:] and sys.argv[1] == "--work":
-        execute(job_dir(sys.argv[2]))
+        execute(job_dir(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else None)
     else:
         try:
             print(json.dumps(handle(json.load(sys.stdin)), ensure_ascii=False))

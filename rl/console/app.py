@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from connection import Connection, inspect_key, whole_number
+from connection import DEFAULT_ROOT, Connection, inspect_key, whole_number
 from results import result_package
 
 WORKBENCH = Path(__file__).resolve().parents[2] / "sample_app/周报演示应用/晶圆厂布局工作台.html"
@@ -62,21 +62,35 @@ def guarded(fn):
     return run
 
 
-def connect(key, host, port, user, password, pin, request: gr.Request):
+def connect(key, host, port, user, password, pin, root, request: gr.Request):
     disconnect(key)
     try:
-        session = Connection(host, port, user, password, pin)
+        session = Connection(host, port, user, password, pin, root)
     except Exception as error:
-        return "", "", f"连接失败。{html.escape(str(error))}", gr.Timer(active=False)
+        return (
+            "",
+            "",
+            f"连接失败。{html.escape(str(error))}",
+            gr.Timer(active=False),
+            gr.update(interactive=True),
+        )
     token = secrets.token_hex(24)
     session.exports = {}
     session.browser = request.session_hash
     SESSIONS[token] = session
-    return token, "", f"已连接 {user}@{host}（SSH {int(port)}）", gr.Timer(value=4, active=True)
+    return (
+        token,
+        "",
+        f"已连接 {user}@{host}（SSH {int(port)}）",
+        gr.Timer(value=4, active=True),
+        gr.update(value=str(session.root), interactive=False),
+    )
 
 
 def start_setup(key, progress=gr.Progress()):
     session = require_session(key)
+    progress(0, desc="正在准备固定版本的 Git 代码和全厂数据")
+    session.stage_release(lambda sent, total: progress(sent / total, desc="正在上传 Git 提交包"))
     progress(0, desc="正在准备演示策略")
     session.install_demo(lambda sent, total: progress(sent / total, desc="正在上传演示策略"))
     progress(1, desc="已发送部署请求")
@@ -159,6 +173,8 @@ def refresh(key, selected, device, checkpoint, directory):
         info += f"\n\n{KINDS[state['kind']]} · **{STATES[state['status']]}**　{html.escape(state['detail'])}"
         if state["status"] == "running" and "rss" in state:
             info += f"　任务 RSS {state['rss'] / 1024:.2f} GiB　显存 {state['vram'] / 1024:.2f} GiB"
+        if state["status"] in {"completed", "stopped", "failed"} and state.get("peak_vram"):
+            info += f"　任务采样显存峰值 {state['peak_vram']:,} MiB"
         if (state["kind"], state["status"]) == ("infer", "completed"):
             link = bundle_link(session, state["id"], directory)
         if (state["kind"], state["status"]) == ("train", "completed"):
@@ -194,10 +210,16 @@ def build_panel(directory):
                 host = gr.Textbox(label="服务器 IP 或主机名", placeholder="输入服务器地址", scale=2)
                 port = gr.Textbox(label="SSH 端口", value="2202", max_lines=1)
                 user = gr.Textbox(label="SSH 用户名")
+            root = gr.Textbox(
+                label="远端部署目录",
+                value=DEFAULT_ROOT,
+                max_lines=1,
+                info="代码、uv 环境、模型和作业保存在这里。可填绝对路径或 ~/ 路径，断开后可切换目录。",
+            )
             with gr.Row():
                 pin = gr.Textbox(
                     label="主机 SHA256 指纹",
-                    info="首次连接请与管理员核对。已在本机 known_hosts 中登记的主机可留空。",
+                    info="指纹用来在发送密码前验证服务器身份。首次请与管理员提供的指纹核对，已在本机 known_hosts 登记的主机可留空。",
                     scale=3,
                 )
                 verify = gr.Button("读取主机指纹")
@@ -256,8 +278,8 @@ def build_panel(directory):
         verify.click(guarded(inspect_key), [host, port], pin, **event)
         connected = login.click(
             connect,
-            [session, host, port, user, password, pin],
-            [session, password, connection_status, tick],
+            [session, host, port, user, password, pin, root],
+            [session, password, connection_status, tick, root],
             **event,
         )
 
@@ -268,9 +290,9 @@ def build_panel(directory):
 
         def leave(key):
             disconnect(key)
-            return "", "", "已断开 SSH。", gr.Timer(active=False)
+            return "", "", "已断开 SSH。", gr.Timer(active=False), gr.update(interactive=True)
 
-        logout.click(leave, session, [session, password, connection_status, tick], **event).then(
+        logout.click(leave, session, [session, password, connection_status, tick, root], **event).then(
             guarded(first), session, view, **event
         )
         after(deploy.click(guarded(start_setup), session, job, **{**event, "show_progress": "full"}))
