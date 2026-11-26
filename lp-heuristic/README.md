@@ -11,18 +11,19 @@
 |---|---|
 | 操作系统 | Windows / Linux / macOS |
 | Python | ≥ 3.10 |
-| 依赖包 | numpy、scipy、openpyxl、highspy（可选 cupy-cuda12x） |
+| 依赖包 | numpy、scipy、openpyxl、matplotlib、highspy（可选 cupy-cuda12x） |
 
 安装依赖（等价于 `requirements.txt`）：
 
 ```powershell
-pip install numpy scipy openpyxl highspy
+pip install numpy scipy openpyxl matplotlib highspy
 ```
 
 > 说明：
 > - `scipy.optimize.milp`（HiGHS 混合整数求解器）需要 scipy ≥ 1.9；
 > - `scipy.optimize.linprog(method="highs")` 与 `scipy.sparse.csgraph.dijkstra` 由 scipy 提供；
 > - `openpyxl` 仅 E0 读取 SMAT2022 的 Excel 工作簿时使用；
+> - `matplotlib` 仅桌面应用 `app/` 的可视化展示使用；
 > - `highspy` 用于 E3 的持久化 warm-start 内层 LP；未安装时 E3 会自动回退到 scipy 冷求解（不影响正确性）；
 > - `cupy-cuda12x` 可选，仅用于 `gpu_distance.py` 的 GPU 距离矩阵加速（需 NVIDIA GPU + CUDA）。
 
@@ -31,13 +32,14 @@ pip install numpy scipy openpyxl highspy
 ## 2. 目录结构
 
 ```
-week6/
+lp-heuristic/
+├── app/                  # 桌面 GUI 应用源码（tkinter + matplotlib，见 3.6 节）
 ├── data/                 # 输入数据（SMT2020_* 生产数据 + SMAT2022 Excel）
-├── docs/                 # 数据集说明、实验方案、方法论文档
-├── scripts/              # 全部可执行脚本（E0 / E1 / E2 / E3）
+├── scripts/              # 全部可执行脚本（E0 / E1 / E2 / E3 + 交互 HTML 构建）
 ├── output/               # 运行产物（审计、LP、布局优化结果）
-├── 汇报准备/ 汇报成稿/    # 汇报相关材料
-└── README.md
+├── result/               # 桌面应用训练结果输出（heuristic / sample）
+├── readme.md
+└── requirements.txt
 ```
 
 `scripts/` 下的脚本：
@@ -54,13 +56,15 @@ week6/
 | `e2_visualize.py` | E2 | 优化前后布局对比可视化 |
 | `e3_heuristic.py` | E3 | 全局布局-流量联合启发式（模拟退火 SA + LNS + 内层 LP） |
 | `e3_warmstart.py` | E3 | 持久化 HiGHS warm-start 内层 LP（被 `e3_heuristic.py` 调用） |
+| `build_e2_interactive.py` | E2 | 构建 E2 布局结果的离线交互 HTML（`交互展示/`） |
+| `build_e3_interactive.py` | E3 | 构建 E3 布局结果的离线交互 HTML（`交互展示/`） |
 | `gpu_distance.py` | 工具 | CuPy GPU 设备距离矩阵（可选，无 GPU 时回退 CPU） |
 
 ---
 
 ## 3. 运行说明
 
-所有命令均在项目根目录（`week6/`）下执行，使用 `--help` 可查看完整参数。
+所有命令均在项目根目录（`lp-heuristic/`）下执行，使用 `--help` 可查看完整参数。
 
 ### 3.1 数据准备
 
@@ -88,7 +92,8 @@ python scripts/e1_visualize.py --e1-dir output/e1_reference_lp
 `--utilization`（有效机时系数，默认 0.85）、`--top-k`（运输弧稀疏化，默认 12，0 表示全部）、
 `--edge-length-mode`（`manhattan`/`euclidean`）。
 
-产物：`transport_flow.csv`、`from_to_bay.csv`、`operation_flow.csv`、`device_utilization.csv`、`e1_report.md` 等。
+产物：`transport_flow.csv`、`from_to_bay.csv`、`operation_flow.csv`、`device_utilization.csv`、
+`selected_equipment_ports.csv`、`bay_flow.csv`、`e1_summary.json`、`e1_report.md`、`e1_visualization.html` 等。
 
 ### 3.4 E2 MILP 布局优化
 
@@ -142,6 +147,20 @@ python scripts/e3_heuristic.py --production-model LVHM --output-dir output/e3_gl
 > - E3 依赖 E1 的 `transport_flow.csv` 作为初始流量，因此 **E3 前需先运行 E1**。
 
 产物：`layout.csv`（设备新槽位坐标）、`e3_summary.json`（参考/优化成本与降幅、移动设备数等）。
+
+### 3.6 桌面 GUI 应用
+
+```powershell
+python app/main.py
+```
+
+将 E1→E3 训练流程与结果可视化封装为桌面应用（tkinter + matplotlib），包含三个 Tab：
+
+- **① 推理（训练）**：上传订单文件 → 运行 E1→E3 训练 → 实时显示进度与日志 → 结果保存到 `result/<运行编号>/`；
+- **② 加载（展示）**：选择结果目录，展示设备布局（可按 Bay / 设备组 / 利用率热力图着色）、设备间物流关系、通道物流频率热力图；
+- **③ 接口说明**：用户接口（上传/下载格式与字段含义）+ 开发者接口（目录结构、函数接口、拓展指引）。
+
+每个运行结果目录包含 `layout.csv`、`transport_flow.csv`、`device_utilization.csv`、`from_to_bay.csv`、`rails.csv`、`summary.json`；`result/sample` 与 `result/heuristic` 为内置示例。详情见 `app/README.md`。
 
 ---
 

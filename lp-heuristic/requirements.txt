@@ -14,6 +14,9 @@ scipy>=1.9
 # 读取 SMAT2022 Excel 工作簿（仅 E0 数据审计使用）
 openpyxl>=3.0
 
+# 桌面 GUI 应用（app/）的可视化展示（tkinter 为 Python 标准库，Windows 自带）
+matplotlib>=3.5
+
 # E3 持久化 warm-start 内层 LP（e3_warmstart.py / e3_heuristic.py --warm-start）
 # 未安装时 e3_heuristic 会自动回退到 scipy 冷求解，不影响正确性
 highspy>=1.7
