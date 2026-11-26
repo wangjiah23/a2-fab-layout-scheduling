@@ -1,0 +1,49 @@
+{
+  "run_id": "heuristic",
+  "description": "E3 全局布局-流量联合启发式（SA + LNS + warm-start LP）优化结果示例",
+  "order_file": "内置 LVHM 示例订单",
+  "generated_at": "2026-10-22T01:05:07.768805+00:00",
+  "problem": {
+    "production_model": "LVHM",
+    "equipment_count": 1068,
+    "operation_count": 3866,
+    "horizon_min": 10080.0,
+    "demand_scale": 0.25,
+    "utilization": 0.85,
+    "top_k": 12
+  },
+  "result": {
+    "reference_cost": 5803123608.491474,
+    "optimized_cost": 2656824536.429499,
+    "cost_reduction": 3146299072.061975,
+    "cost_reduction_pct": 54.21733680561489,
+    "moved": 1049
+  },
+  "solver": {
+    "name": "HiGHS",
+    "e1_solver_status": 0,
+    "e1_solver_success": true,
+    "lp_count": 1294,
+    "elapsed_sec": 821.243879571557
+  },
+  "distance": {
+    "equipment_count": 1068,
+    "missing_port_path": [],
+    "unreachable_equipment_pairs": 0,
+    "reachable_equipment_pairs": 1140624
+  },
+  "stats": {
+    "transport_arcs": 4057,
+    "bay_arcs": 275,
+    "total_flow_lots": 38609.98,
+    "equipment_with_utilization": 595,
+    "avg_utilization": 0.2017,
+    "avg_utilization_busy": 0.3621,
+    "max_utilization": 1.0,
+    "high_load_equipment": 57
+  },
+  "reference_cost": 5803123608.491474,
+  "optimized_cost": 2656824536.429499,
+  "cost_reduction_pct": 54.21733680561489,
+  "moved": 1049
+}

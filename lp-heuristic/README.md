@@ -31,7 +31,7 @@ pip install numpy scipy openpyxl highspy
 ## 2. 目录结构
 
 ```
-lp-heuristic/
+week6/
 ├── data/                 # 输入数据（SMT2020_* 生产数据 + SMAT2022 Excel）
 ├── docs/                 # 数据集说明、实验方案、方法论文档
 ├── scripts/              # 全部可执行脚本（E0 / E1 / E2 / E3）
@@ -60,7 +60,7 @@ lp-heuristic/
 
 ## 3. 运行说明
 
-使用 `--help` 可查看完整参数。
+所有命令均在项目根目录（`week6/`）下执行，使用 `--help` 可查看完整参数。
 
 ### 3.1 数据准备
 
