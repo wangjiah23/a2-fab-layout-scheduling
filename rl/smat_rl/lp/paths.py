@@ -350,7 +350,7 @@ class PathLP:
                 return 1
         raise RuntimeError(f"Path master: {master.modelStatusToString(status)}")
 
-    def solve(self, device_at_slot, pricing=None):
+    def solve(self, device_at_slot, pricing=None, *, include_allocation=False):
         started = time.perf_counter()
         master_seconds = pricing_seconds = column_seconds = 0.0
         master_recoveries = 0
@@ -417,8 +417,18 @@ class PathLP:
                 )
                 if residual <= 1e-5:
                     columns = len(self.paths)
+                    allocation = {}
+                    if include_allocation:
+                        # Read before pruning, while column numbers match the HiGHS solution.
+                        allocation["paths"] = [
+                            (p, path, lots)
+                            for (p, path), lots in zip(self.paths, solution.col_value)
+                            if lots > 0
+                        ]
+                        allocation["loads"] = values[self.products :].copy()
                     self._prune(solution)
                     return {
+                        **allocation,
                         "cost": value * SCALE,
                         "dual_lower_bound": lower * SCALE,
                         "global_relative_gap_bound": gap,

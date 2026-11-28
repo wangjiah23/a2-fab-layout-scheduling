@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 def json_save(path, value):
     pending = path.with_name(path.name + ".tmp")
-    pending.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+    pending.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     pending.replace(path)
 
 

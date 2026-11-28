@@ -4,7 +4,7 @@ const areaLabels={Dry_Etch:'干法刻蚀',Litho:'光刻',Wet_Etch:'湿法刻蚀'
 const colorFor=area=>Object.hasOwn(areaColors,area)?areaColors[area]:areaColors['其他'];
 function makeMap(host,r,initialName='',replay=null){
   let mode=replay?'both':'after',bay='',zoom=1,panX=0,panY=0,selected=initialName,tracks=r.plant,pan=null,plot=[],raf=0,disposed=false;
-  const before=r.before||[],after=r.after;
+  const before=r.before||[],after=(replay&&r.policy)||r.after;
   let step=0,timer=null;
   const maps=[new Map(before.map(e=>[e.equipment_name,e])),new Map(after.map(e=>[e.equipment_name,e]))];
   let example=null,maxMove=0;

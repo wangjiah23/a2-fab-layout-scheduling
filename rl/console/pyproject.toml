@@ -1,9 +1,9 @@
 [project]
-name = "a2-rl-console"
-version = "0.1.0"
-description = "Local Gradio workbench for remote E3 PPO jobs"
+name = "a2-layout-workbench"
+version = "0.2.0"
+description = "Hosted factory layout inference service"
 requires-python = ">=3.11,<3.15"
-dependencies = ["gradio>=6.0,<7", "paramiko>=3.5,<6", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "pandas>=2,<4", "numpy>=1.26,<3"]
+dependencies = ["fastapi>=0.115,<1","uvicorn>=0.30,<1","pydantic>=2.10,<3"]
 
 [tool.uv]
 package = false

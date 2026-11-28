@@ -6,7 +6,12 @@
 @media(max-width:720px){.mast{padding:0 14px;height:53px}.brand{font-size:16px}.mast-right{gap:8px}.online{display:none}.workspace{display:flex;flex-direction:column}aside{display:grid;grid-template-columns:1fr 1fr;gap:12px;border-right:0;border-bottom:1px solid var(--line)}.aside-title{display:none}.side-section{margin:0;border:0;padding:0}.side-section.last{grid-column:1/-1;display:flex;align-items:center;gap:10px}.last h3{margin:0}.last .dropzone{width:auto;flex:1;padding:5px}.last .hint{display:none}.factlist{display:none}.metric{min-width:42%}.mapcanvas{height:285px}.footnote span:last-child{display:none}.main-head h1{font-size:23px}.tabs{gap:8px}.viewtop,.table-tools{padding:9px}.method{padding:6px}.source{font-size:11px}.kpis{margin:10px 0}}
 
 [hidden]{display:none!important}
-.remote-frame{display:block;border:0;width:100%;height:850px;background:#fff}
+.solve-pane{padding:22px clamp(16px,3vw,36px) 28px}
+.solve-pane h2{margin:0 0 8px;font-size:17px}.solve-pane .tools+h2{margin-top:24px}
+.solve-pane p{margin:0 0 14px;line-height:1.7}.solve-pane .tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.solve-pane .primary,.solve-pane .outline{width:auto;padding:9px 18px}
+.run-status{font-size:13px;color:var(--ink)}.hosted-downloads{display:flex;flex-wrap:wrap;gap:10px;margin:12px 0}
+.hosted-downloads a{text-decoration:none}
 .placement-controls{flex-wrap:wrap;align-items:center;padding:10px 16px;border-top:1px solid var(--line)}
 .placement-controls input[type=range]{min-width:100px;flex:1;accent-color:var(--teal)}
 .placement-controls output{font:600 12px var(--mono);white-space:nowrap}

@@ -1,4 +1,5 @@
 'use strict';
+const hosted=['http:','https:'].includes(location.protocol);
 const baseline=normalizeScene(DB.scene),changed=normalizeScene(DB.changed);
 const baselineKey=sceneKey(baseline),externalRegistry=new Map();
 const cases=new Map([
@@ -53,7 +54,7 @@ function caseForScene(s,label){
 function chooseCase(id,requested=null){
   currentCase=id;$('cases').value=id;const c=chosen(),possible=methodsFor(c);
   method=possible.includes(requested)?requested:possible.includes(method)?method:possible[0]||null;
-  result=c.standalone?c.result:null;tab=firstTab(result);focused='';message();render();
+  result=c.standalone?c.result:null;tab=onlineAvailable()?'online':firstTab(result);focused='';message();render();
 }
 function showResult(){
   const r=findResult(chosen(),method);
@@ -65,18 +66,18 @@ function switches(){
   for(const m of methodsFor(c)){
     const available=!!findResult(c,m),row=el('label','method'+(method===m?' active':''));
     const radio=el('input');radio.type='radio';radio.name='method';radio.checked=method===m;radio.value=m;
-    radio.onchange=()=>{method=m;result=null;tab='pending';focused='';message();render();};
-    row.append(radio,el('span','',methodLabel(m)),el('small','',available?'已归档':'待求解'));host.append(row);
+    radio.onchange=()=>{method=m;result=null;tab=onlineAvailable()?'online':'pending';focused='';message();render();};
+    row.append(radio,el('span','',methodLabel(m)),el('small','',hosted&&m==='rl'&&!c.local?'在线求解':available?'已归档':'待求解'));host.append(row);
   }
   if(c.standalone)host.append(el('p','muted','独立布局文件'));
   const ready=!!findResult(c,method);
   $('loadResult').disabled=!ready||!!c.standalone;$('loadResult').textContent=ready?'查看离线结果  →':'暂无离线结果';
-  $('rlRemote').hidden=method!=='rl'||c.local||c.standalone||sceneKey(c.scene)!==baselineKey;
+  $('rlRemote').hidden=!onlineAvailable();
   $('exportJob').hidden=!!(c.standalone||c.local);$('showInputs').disabled=!!c.standalone;
   $('inputFacts').replaceChildren();
   if(c.standalone){$('inputFacts').append(fact('文件类型','独立布局'),fact('设备数',fmt(c.result.after.length)));return;}
   if(c.local){$('inputFacts').append(fact('研究区域','A2 / A3'),fact('局部设备位','48'),fact('区域加工工序','59'));return;}
-  const f=sceneFacts(c.scene);$('inputFacts').append(fact('计划周期','7 天'),fact('产品 / 路线数',c.scene.demands.length+' / '+f.routes),fact('需求合计',fmt(f.lots,3)+' lot'));
+  const f=sceneFacts(c.scene);$('inputFacts').append(fact('计划周期',fmt(c.scene.horizon_min/1440,2)+' 天'),fact('产品 / 路线数',c.scene.demands.length+' / '+f.routes),fact('需求合计',fmt(f.lots,3)+' lot'));
 }
 function metric(label,value,unit='',featured=false){
   const m=el('div','metric'+(featured?' featured':'')),b=el('b','',value);
@@ -85,7 +86,7 @@ function metric(label,value,unit='',featured=false){
 function metrics(){
   const box=$('kpis'),c=chosen();box.replaceChildren();
   if(!result){
-    const f=sceneFacts(c.scene);box.append(metric(c.local?'局部设备位':'固定生产设备',c.local?'48':'1,068','台',true),metric('产品需求',fmt(f.lots,3),'lot'),metric(c.local?'区域加工工序':'路线加工工序',fmt(c.local?59:f.steps),'道'),metric('有效产能系数','85','%'));return;
+    const f=sceneFacts(c.scene);box.append(metric(c.local?'局部设备位':'固定生产设备',c.local?'48':'1,068','台',true),metric('产品需求',fmt(f.lots,3),'lot'),metric(c.local?'区域加工工序':'路线加工工序',fmt(c.local?59:f.steps),'道'),metric('有效产能系数',fmt(c.scene.effective_time_fraction*100,2),'%'));return;
   }
   const r=result,m=r.metrics||{};
   if(r.kind==='rl'){
@@ -93,8 +94,9 @@ function metrics(){
     box.append(metric('第 95 轮成本降幅',get(95),'%',true),metric('第 295 轮成本降幅',get(295),'%'),metric('评估记录',DB.rl.curve.length,'次'),metric('全厂设备','1,068','台'));return;
   }
   if(r.local){box.append(metric('区域相关成本降幅',m.cost_reduction_pct.toFixed(2),'%',true),metric('区域机位','48','个'),metric('设备组变化的机位','6','个'),metric('区域加工工序','59','道'));return;}
-  if(m.cost_reduction_pct!==undefined){
-    box.append(metric('运输成本降幅',grade(m.cost_reduction_pct),'%',true),metric('布局设备',fmt(r.after.length),'台'));
+  if(m.optimized_cost!==undefined){
+    const objective=m.cost_reduction_pct===undefined?metric('推荐运输成本',fmt(m.optimized_cost,2),'',true):metric('运输成本降幅',grade(m.cost_reduction_pct),'%',true);
+    box.append(objective,metric('布局设备',fmt(r.after.length),'台'));
     if(m.moved!==undefined)box.append(metric('调整机位的设备',fmt(m.moved),'台'));
     if(m.elapsed_sec!==undefined)box.append(metric(r.replay?'推理及 LP 耗时':'离线求解耗时',grade(m.elapsed_sec),'秒'));
   }else{
@@ -107,7 +109,7 @@ function resultTabs(){
   if(onlineAvailable())tabs.unshift(['online','在线运行']);
   return tabs;
 }
-function onlineAvailable(){return method==='rl'&&!chosen().local&&!chosen().standalone&&sceneKey(chosen().scene)===baselineKey;}
+function onlineAvailable(){return hosted&&method==='rl'&&!chosen().local&&!chosen().standalone;}
 function layoutTabs(){
   const c=chosen(),r=result;if(!r)return [['pending','场景状态'],['inputs','输入数据']];
   if(r.kind==='rl')return [['replay','布局回放'],['chart','训练评估'],['inputs','输入数据']];
@@ -127,6 +129,7 @@ function showMetrics(host,r){
     if(k==='optimized_cost')bar.className='opt';track.append(bar);row.append(el('span','',label),track,v);bars.append(row);
   }host.append(bars);
   const rows=[];
+  if(m.policy_cost!==undefined)rows.push(['PPO 候选成本',fmt(m.policy_cost,2),r.selection==='initial'?'已选用输入布局':'已选用 PPO 布局']);
   if(m.reference_cost!==undefined&&m.optimized_cost!==undefined)rows.push(['运输成本减少量',fmt(m.reference_cost-m.optimized_cost,2),'使用实验记录中的原始目标单位']);
   if(m.cost_reduction_pct!==undefined)rows.push(['相对参考布局降幅',grade(m.cost_reduction_pct)+'%',local?'仅统计受区域决策影响的成本':'相对该次实验的参考布局']);
   if(m.lp_count!==undefined)rows.push(['LP 调用次数',fmt(m.lp_count)+' 次','本次归档的运行统计']);
@@ -145,14 +148,18 @@ function showTab(id,focus=''){
   }
   const expand=btn('放大视图',toggleExpanded,'expand-view');expand.id='expandView';expand.title='展开以便投影，按 Esc 返回';tabHost.append(expand);syncExpanded();
   const online=id==='online';
-  $('title').textContent=online?'全厂 PPO 训练与推理':r?r.title:c.local?'A2 / A3 区域场景':c.label.replace(/^LVHM · /,'').replace(/^导入 · /,'')+' · 场景输入';
+  $('rlRemote').hidden=online||!onlineAvailable();
+  $('loadResult').className=onlineAvailable()?'outline wide':'primary wide';
+  $('title').textContent=online?'全厂布局求解':r?r.title:c.local?'A2 / A3 区域场景':c.label.replace(/^LVHM · /,'').replace(/^导入 · /,'')+' · 场景输入';
   $('footerContext').textContent=r&&!online?'来源 · '+r.source:'当前场景 · '+c.label+'  /  '+methodLabel(method);
   $('source').hidden=!r||online;$('kpis').hidden=online;
-  $('remotePanel').hidden=!online;host.hidden=online;
-  if(id==='online')openRemote();
+  if(id==='online')onlineView(host);
   else if(id==='map')cleanup=makeMap(host,r,focus);
   else if(id==='table')layoutTable(host,r,n=>showTab('map',n));
-  else if(id==='replay')cleanup=r.replay?makeMap(host,r,'',r.replay):replayView(host);
+  else if(id==='replay'){
+    if(r.selection==='initial')host.append(el('p','placement-action','本次推荐保留输入布局。这里回放的是 PPO 生成的候选布局。'));
+    cleanup=r.replay?makeMap(host,r,'',r.replay):replayView(host);
+  }
   else if(id==='chart')cleanup=chartView(host);
   else if(id==='flow')localFlow(host);
   else if(id==='metrics')showMetrics(host,r);
@@ -160,8 +167,8 @@ function showTab(id,focus=''){
   else{
     const ready=!!findResult(c,method);
     const box=callout(host,ready?'这组输入已有离线结果':'这组输入尚无求解记录',
-      ready?'已匹配当前工厂、产品需求与工艺路线。载入后可查看此次实验的方案。':'可将该场景导出给线下求解程序，获得结果后通过“导入布局结果”查看。');
-    box.append(btn(ready?'载入并展示结果':'导出本场景任务',ready?showResult:exportJob));
+      ready?'已匹配当前工厂、产品需求与工艺路线。载入后可查看此次实验的方案。':(onlineAvailable()?'点击在线求解，即可按本次输入计算。':'可将该场景导出给线下求解程序，获得结果后通过“导入布局结果”查看。'));
+    box.append(btn(onlineAvailable()?'在线求解':ready?'载入并展示结果':'导出本场景任务',onlineAvailable()?()=>showTab('online'):ready?showResult:exportJob));
     inputView(host,c.scene,!!c.local);
   }
 }
@@ -175,7 +182,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.class
 function render(){
   const c=chosen(),r=result;switches();metrics();
   $('context').textContent=c.standalone?'外部文件  /  布局查看':('SMAT2022 · LVHM_E  /  '+(c.local?'区域验证':'全厂规划'));
-  showTab(tab,focused);
+  showTab(tab,focused);jobDownloads();
 }
 function exportJob(){
   const c=chosen();if(!c.scene||c.local)return;
@@ -185,10 +192,11 @@ function exportJob(){
 }
 function guide(){
   modal('使用指南',body=>{
-    section(body,'现场展示','打开后为全厂启发式 + LP 归档。可先看“指标对照”，再切换到强化学习，点击“查看离线结果”，播放设备逐步放置的过程。');
-    section(body,'运行全厂 PPO','选择全厂基准与强化学习，点“远程训练与推理”。在在线运行页连接服务器，可分别指定推理设备和训练设备。推理结束后自动载入实际动作，可逐台查看至终局。');
-    section(body,'切换生产输入','通过“导入生产场景”选择 Excel、CSV 或 JSON。模板包含产品需求和新增路线。当前工厂固定为 SMAT2022 LVHM_E，计划期为 7 天。');
+    section(body,'查看归档','选择求解方法后点“查看离线结果”，可查看已有启发式实验或第 95 轮设备放置回放。');
+    section(body,'运行全厂 PPO','导入生产场景，按需更换起始布局，点击“开始求解”。服务使用已部署的 PPO 策略，并按本次订单重算两份布局的运输成本。结果可逐步回放或下载。');
+    section(body,'切换生产输入','接受场景 XLSX、CSV、JSON 或 SMT2020 order.txt。订单按 E1 的稳态到达率折算为 7 天需求，需求缩放系数为 0.25。JSON 支持更改计划期和产能系数。');
     body.append(btn('下载基准场景 XLSX',()=>downloadTemplate('baseline')),btn('下载配比变化 XLSX',()=>downloadTemplate('changed')));
+    if(hosted)body.append(jobDownload('下载 SMT2020 订单 TXT','/api/templates/order.txt'));
     section(body,'查看外部布局','CSV 至少提供 equipment_name、x、y 三列。可补充 tool_group、bay、width、height。含 layout.csv 和同目录 summary.json 或 e3_summary.json 的 ZIP 也可导入。');
     section(body,'关联新的离线计算','JSON 结果包用 schema=fab-result-v1，附导出任务中的 scenario、method，以及本厂完整的 layout 和可选 metrics。导入后，本次打开应用期间可以通过同一场景与方法重新载入。');
     body.append(btn('下载示例布局 CSV',()=>download('03_启发式全厂布局.csv',b64Bytes(DB.rawCsv),'text/csv')),btn('下载示例结果包 JSON',()=>download('04_启发式离线结果包.json',JSON.stringify({schema:'fab-result-v1',scenario:baseline,method:'heuristic_lp',metrics:DB.e3.metrics,layout:DB.e3.layout}),'application/json')));
@@ -200,7 +208,7 @@ function sourceInfo(){
     section(body,r.source,r.kind==='e3'?'week7_heuristic.zip 内的 e3_global/layout.csv 与 e3_summary.json。参考设备位及轨道来自 SMAT2022 LVHM_E。':
       r.kind==='rl'?'A2_期中汇报.pptx 第 19 页原始图表数据与第 20 页第 95 轮布局动画。记录按原顺序抽帧，支持逐段播放。':
       r.local?'week6/MILP交互展示.html 内嵌的机位、加工分配、边界物流及求解汇总。':(r.scene?'文件包含场景、求解方法与完整设备布局，已在本次会话中关联。':'按文件内的设备坐标独立绘制。'));
-    if(r.replay)section(body,'推理记录',(r.replay.checkpoint||'PPO 检查点')+' · 第 '+(r.replay.cycle??'—')+' 轮，含 '+r.replay.rows.length+' 次实际放置。终局成本来自该布局的运输 LP。');
+    if(r.replay)section(body,'推理记录',(r.replay.checkpoint||'PPO 检查点')+' · 第 '+(r.replay.cycle??'—')+' 轮，含 '+r.replay.rows.length+' 次实际放置。指标对照列出输入布局和 PPO 候选各自的运输 LP 成本。');
     else section(body,'求解方式','归档案例在软件外计算。工作台核对输入并展示已有结果。');
     if(r.kind==='e3')section(body,'指标口径','运输成本按原实验的 LP 目标计量，耗时为该次离线求解记录。布局与固定轨道可逐 Bay 查看。');
     if(r.kind==='rl')section(body,'记录范围','评估曲线覆盖第 0 至 295 轮，回放取自第 95 轮。此次归档提供过程图像与评估数据。');
@@ -212,8 +220,8 @@ async function importScene(file){
   if(!file)return;const seq=++importSerial;
   try{
     const s=await readSceneFile(file);if(seq!==importSerial)return;
-    const id=caseForScene(s,file.name);chooseCase(id,method);
-    message('已导入 '+file.name+'。'+(findResult(chosen(),method)?'场景内容与归档匹配，可查看离线结果。':'当前输入尚无该方法的结果，可导出离线任务。'));
+    const id=caseForScene(s,file.name);chooseCase(id,hosted?'rl':method);
+    if(onlineAvailable())showTab('online');message('已导入 '+file.name+'。');
   }catch(e){if(seq===importSerial)message('导入场景失败。'+e.message,true);}
 }
 async function importResult(file,autoplay=false){
@@ -231,50 +239,8 @@ async function importResult(file,autoplay=false){
     return r;
   }catch(e){if(seq===importSerial)message('导入结果失败。'+e.message,true);}
 }
-const localConsole=['http:','https:'].includes(location.protocol)&&['127.0.0.1','localhost','[::1]'].includes(location.hostname);
-let remoteFrame=null,lastResultToken='',pendingResultToken='';
-function openRemote(){
-  const host=$('remotePanel');
-  if(!localConsole){
-    if(!host.childElementCount)callout(host,'在线运行需要本机服务','在仓库 rl/console 下运行 uv run --locked --python 3.11 python app.py，再打开 http://127.0.0.1:7860 。此离线文件可直接导入含动作的 JSON 回放。');
-    return;
-  }
-  if(!remoteFrame){
-    remoteFrame=el('iframe','remote-frame');remoteFrame.title='远程训练与推理';remoteFrame.src='/rl/panel/?__theme=light';
-    remoteFrame.onload=()=>{
-      const doc=remoteFrame.contentDocument;
-      const fit=()=>{
-        const log=doc?.getElementById('rl-task-log');
-        if(!log||!log.offsetHeight)return;
-        const height=Math.ceil(log.getBoundingClientRect().bottom+remoteFrame.contentWindow.scrollY+22);
-        if(height>0)remoteFrame.style.height=Math.max(420,height)+'px';
-      };
-      if(doc?.body){new ResizeObserver(fit).observe(doc.body);new MutationObserver(fit).observe(doc.body,{childList:true,subtree:true});fit();}
-
-    };
-    host.append(remoteFrame);
-  }
-  if(pendingResultToken){const token=pendingResultToken;pendingResultToken='';loadRemoteResult(token,true);}
-}
-$('rlRemote').onclick=()=>showTab('online');
-window.addEventListener('message',event=>{
-  if(!localConsole||event.origin!==location.origin||event.source!==remoteFrame?.contentWindow||event.data?.type!=='fab-rl-result')return;
-  const token=event.data.token;if(typeof token!=='string'||!/^[a-f0-9]{40}$/.test(token)||(token===lastResultToken&&!event.data.force))return;
-  if(tab==='online'&&onlineAvailable())loadRemoteResult(token,true);
-  else if(token!==lastResultToken)pendingResultToken=token;
-});
-async function loadRemoteResult(token,autoplay=false){
-  if(!localConsole||!token)return;
-  if(!/^[a-f0-9]{40}$/.test(token)){message('推理结果链接无效。',true);return;}
-  try{
-    const response=await fetch('/rl-results/'+token,{cache:'no-store'});
-    if(!response.ok)throw Error('请在远程运行页重新打开这次推理，或导入已下载的结果包。');
-    const file=new File([await response.blob()],'E3-PPO-fab-result.json',{type:'application/json'});
-    if(autoplay&&(tab!=='online'||!onlineAvailable())){pendingResultToken=token;return;}
-    if(await importResult(file,autoplay))lastResultToken=token;
-  }catch(error){message('读取推理结果失败。'+error.message,true);}
-}
 $('cases').onchange=()=>{importSerial++;chooseCase($('cases').value);};
+$('rlRemote').onclick=()=>showTab('online');
 $('loadResult').onclick=showResult;$('exportJob').onclick=exportJob;$('template').onclick=()=>downloadTemplate('baseline');
 $('guide').onclick=guide;$('source').onclick=sourceInfo;$('closeDialog').onclick=()=>$('dialog').close();
 $('dialog').onclick=e=>{if(e.target===$('dialog')){const b=$('dialog').getBoundingClientRect();if(e.clientX<b.left||e.clientX>b.right||e.clientY<b.top||e.clientY>b.bottom)$('dialog').close();}};
@@ -284,6 +250,9 @@ $('sceneFile').onchange=e=>{const f=e.target.files[0];e.target.value='';importSc
 $('resultFile').onchange=e=>{const f=e.target.files[0];e.target.value='';importResult(f);};
 const drop=$('uploadResult');drop.ondragover=e=>{e.preventDefault();drop.classList.add('drag');};drop.ondragleave=()=>drop.classList.remove('drag');
 drop.ondrop=e=>{e.preventDefault();drop.classList.remove('drag');importResult(e.dataTransfer.files[0]);};
-if(localConsole&&location.pathname.replace(/\/$/,'')==='/rl'){chooseCase('baseline','rl');showTab('online');}
-else render();
-loadRemoteResult(new URLSearchParams(location.search).get('rl_result'));
+if(hosted){
+  document.querySelector('.online').textContent='●  在线工作台';
+  chooseCase('baseline','rl');showTab('online');
+  const key=new URLSearchParams(location.search).get('job');
+  if(key&&/^[a-f0-9]{40}$/.test(key))restoreJob(key);
+}else render();

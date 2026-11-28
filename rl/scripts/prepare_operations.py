@@ -40,6 +40,7 @@ def main(source_repo, instance):
         destination,
         group_ids=np.asarray(group_ids, dtype="<i2"),
         tau=np.asarray(times, dtype="<f8"),
+        piece_scaled=np.asarray([op["ptper"] in {"per_piece", "per_batch"} for op in operations]),
         product_offsets=np.asarray([0, *np.cumsum([n for _, n in routes])], dtype="<i4"),
         demands=np.asarray([demands[p] for p, _ in routes], dtype="<f8"),
     )

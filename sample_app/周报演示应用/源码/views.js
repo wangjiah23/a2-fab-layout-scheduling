@@ -24,13 +24,14 @@ function inputView(host,s,local=false){
     area.replaceChildren();
     const d=s.demands.find(d=>d.part===chooser.value);
     if(!d){
-      area.append(simpleTable(['产品','工艺路线','计划需求（lot）','加工工序','等待工序'],s.demands.map(d=>{
-        const steps=routeSteps(s,d.route);return [d.part,d.route,fmt(d.demand_lots,6),steps.filter(x=>x[1]==='process').length,steps.filter(x=>x[1]==='delay').length];
+      area.append(simpleTable(['产品','工艺路线','计划需求（lot）','每批片数','加工工序','等待工序'],s.demands.map(d=>{
+        const steps=routeSteps(s,d.route);return [d.part,d.route,fmt(d.demand_lots,6),d.pieces_per_lot??25,steps.filter(x=>x[1]==='process').length,steps.filter(x=>x[1]==='delay').length];
       })));
       area.append(el('p','details-caption','选择一个产品可查看路线顺序、设备族与单批加工时间。固定工厂采用 SMAT2022 LVHM_E 的设备位与运输轨道。'));
     }else{
       area.append(simpleTable(['工序序号','工序类型','原设备族','厂内设备组','分钟 / lot'],routeSteps(s,d.route).map(r=>[
         r[0],r[1]==='delay'?'等待':'加工',r[2]||'—',r[1]==='delay'?'—':(Object.hasOwn(DB.aliases,r[2])?DB.aliases[r[2]]:r[2]),fmt(r[3],5)])));
+      if(d.pieces_per_lot&&Object.hasOwn(DB.routes,d.route))area.append(el('p','details-caption','内置路线表列出标准 25 片/批的工时。本次求解按 '+d.pieces_per_lot+' 片/批重算 per_piece 和 per_batch 工时。'));
     }
   }chooser.onchange=draw;draw();
 }

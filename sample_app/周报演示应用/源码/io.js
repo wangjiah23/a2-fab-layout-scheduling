@@ -69,6 +69,10 @@ function xml(raw){
   return doc;
 }
 const tags=(e,name)=>Array.from(e.getElementsByTagNameNS('*',name));
+function checkGeometryFields(keys){
+  const geometry=keys.find(k=>/轨道|端口|机位|设备清单|厂房几何|^((plant|rails?|ports?|slots?|machines?|equipment|geometry|topology|layout)([_ -].*)?)$/i.test(k));
+  if(geometry)throw Error('“'+geometry+'”涉及厂房几何。既有设备重新摆放请使用“导入起始布局”，变更机位或轨道需要建立新的工厂实例。');
+}
 async function zipEntry(zip,path,mode='string'){
   const entry=zip.file(path);
   if(!entry)throw Error('压缩包中缺少 '+path);
@@ -84,7 +88,7 @@ async function readExcel(file){
   const data={};
   for(const sheet of tags(book,'sheet')){
     const name=sheet.getAttribute('name').trim();
-    if(!['产品需求','新增路线','demands','new_routes'].includes(name))continue;
+    if(!['产品需求','新增路线','demands','new_routes'].includes(name)){checkGeometryFields([name]);continue;}
     const rid=sheet.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships','id');
     const target=relmap.get(rid);
     if(!target)throw Error('工作簿缺少数据表。');
@@ -110,11 +114,14 @@ async function readExcel(file){
 }
 function normalizeScene(obj){
   if(!obj||typeof obj!=='object')throw Error('场景内容不完整。');
+  const allowed=new Set(['factory_id','scope','horizon_min','effective_time_fraction','demands','new_routes','initial_layout']);
+  const unknown=Object.keys(obj).filter(k=>!allowed.has(k));
+  if(unknown.length)throw Error('场景不支持字段 '+unknown.join('、')+'。新增厂房、机位、端口或轨道需建立新的工厂实例。');
   const factory_id=obj.factory_id??DB.scene.factory_id, scope=obj.scope??'full';
   if(factory_id!==DB.scene.factory_id||scope!=='full')throw Error('当前场景导入支持 SMAT2022-LVHM_E 全厂及其既有设备位。');
   const horizon_min=numberField(obj.horizon_min??DB.scene.horizon_min,'计划期');
   const effective_time_fraction=numberField(obj.effective_time_fraction??DB.scene.effective_time_fraction,'有效产能系数');
-  if(horizon_min!==DB.scene.horizon_min||effective_time_fraction!==DB.scene.effective_time_fraction)throw Error('此版本的计划期为 10,080 分钟，有效产能系数为 0.85。');
+  if(horizon_min<=0||effective_time_fraction<=0||effective_time_fraction>1)throw Error('计划期必须为正，有效产能系数须在 (0, 1]。');
   if(!Array.isArray(obj.demands)||!obj.demands.length)throw Error('产品需求表为空。');
   const newRows=obj.new_routes??[];
   if(!Array.isArray(newRows))throw Error('新增路线应为逐工序记录的列表。');
@@ -129,7 +136,7 @@ function normalizeScene(obj){
     const step_type=['process','加工','加工工序'].includes(t)?'process':['delay','等待','延迟'].includes(t)?'delay':null;
     if(!step_type)throw Error('工序类型请填写 process（加工）或 delay（等待）。');
     const stnfam=str(val(r,['stnfam','设备族编号','tool_group']));
-    if(step_type==='process'&&!familySet.has(stnfam)&&!Object.hasOwn(DB.aliases,stnfam))throw Error('设备族 '+(stnfam||'（空）')+' 无法映射到本厂。');
+    if(step_type==='process'&&!familyAreaFold.has(stnfam.toLowerCase())&&!Object.hasOwn(DB.aliases,stnfam))throw Error('设备族 '+(stnfam||'（空）')+' 无法映射到本厂。');
     const time_min_per_lot=numberField(val(r,['time_min_per_lot','单批用时（分钟）','单批用时(分钟)']),'单批用时');
     if(time_min_per_lot<0)throw Error('单批用时应大于或等于零。');
     return {route,step,step_type,stnfam,time_min_per_lot};
@@ -144,15 +151,19 @@ function normalizeScene(obj){
     if(!Object.hasOwn(DB.routes,route)&&!routeIds.has(route))throw Error('找不到路线 '+route+'。请在“新增路线”中填写可映射的工序。');
     const demand_lots=numberField(val(r,['demand_lots','需求量（lot）','需求量(lot)','需求量','lots']),'产品 '+part+' 的需求量');
     if(demand_lots<0)throw Error('产品需求量应大于或等于零。');
-    return {part,route,demand_lots};
+    const pieces=val(r,['pieces_per_lot','每批片数','PIECES']);
+    const pieces_per_lot=pieces===''?25:numberField(pieces,'每批片数');
+    if(!Number.isInteger(pieces_per_lot)||pieces_per_lot<1)throw Error('每批片数须为正整数。');
+    return {part,route,demand_lots,...(pieces_per_lot===25?{}:{pieces_per_lot})};
   }).sort((a,b)=>cmp(a.part,b.part));
   if(!demands.some(r=>r.demand_lots>0))throw Error('请至少为一个产品设置正需求。');
-  return {factory_id,scope,horizon_min,effective_time_fraction,demands,new_routes};
+  const initial_layout=obj.initial_layout==null?null:initialRows(obj.initial_layout);
+  return {factory_id,scope,horizon_min,effective_time_fraction,demands,new_routes,...(initial_layout?{initial_layout}:{})};
 }
 function sceneKey(s){
   const n=v=>Number(Number(v).toPrecision(12));
   return JSON.stringify([s.factory_id,s.scope,s.horizon_min,s.effective_time_fraction,
-    s.demands.map(r=>[r.part,r.route,n(r.demand_lots)]),s.new_routes.map(r=>[r.route,r.step,r.step_type,r.stnfam,n(r.time_min_per_lot)])]);
+    s.demands.map(r=>[r.part,r.route,n(r.demand_lots),r.pieces_per_lot??25]),s.new_routes.map(r=>[r.route,r.step,r.step_type,r.stnfam,n(r.time_min_per_lot)]),s.initial_layout??null]);
 }
 function routeSteps(s,route){
   return Object.hasOwn(DB.routes,route)?DB.routes[route]:s.new_routes.filter(r=>r.route===route).map(r=>[r.step,r.step_type,r.stnfam,r.time_min_per_lot,'新增路线']);
@@ -166,9 +177,55 @@ async function readSceneFile(file){
   const ext=checkFile(file);let obj;
   if(ext==='xlsx')obj=await readExcel(file);
   else if(ext==='csv')obj={demands:objects(csvRows(await file.text()))};
-  else if(ext==='json'){const doc=JSON.parse((await file.text()).replace(/^\uFEFF/,''));obj=doc.scenario??doc;}
-  else throw Error('场景支持 XLSX、CSV 和 JSON 格式。');
+  else if(ext==='txt'){
+    const data=await file.arrayBuffer();let raw;
+    try{raw=new TextDecoder('utf-8',{fatal:true}).decode(data);}catch{raw=new TextDecoder('gbk').decode(data);}
+    obj=orderScene(raw);
+  }else if(ext==='json'){
+    const doc=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
+    if(doc?.schema&&doc.schema!=='fab-job-v1')throw Error('请选择生产场景或 fab-job-v1 任务。布局结果可从“导入布局结果”打开。');
+    if(doc?.scenario){
+      const unknown=Object.keys(doc).filter(k=>!['schema','method','scenario'].includes(k));
+      if(unknown.length){checkGeometryFields(unknown);throw Error('任务中存在未支持的字段 '+unknown.join('、')+'。');}
+    }
+    obj=doc?.scenario??doc;
+  }
+  else throw Error('场景支持 XLSX、CSV、JSON 和 SMT2020 order.txt。');
   return normalizeScene(obj);
+}
+function orderScene(raw){
+  const rows=csvRows(raw),required=['LOT','PART','PRIOR','PIECES','START','RDIST','REPEAT','RUNITS','RPT#','LOTSPERRPT','DUE','ORDER','HOTLOT'];
+  if(!raw.split(/\r?\n/,1)[0].includes('\t')||required.some(field=>!rows[0].includes(field)))throw Error('order.txt 须为含标准 SMT2020 表头的制表符订单文件。');
+  const catalog=new Map(DB.scene.demands.map(d=>[d.part,d.route])),parts=new Map();
+  for(const row of objects(rows)){
+    const part=str(row.PART),pieces=numberField(row.PIECES,'PIECES'),repeat=numberField(row.REPEAT,'REPEAT'),lots=numberField(row.LOTSPERRPT,'LOTSPERRPT');
+    if(!catalog.has(part))throw Error('订单中产品 '+part+' 未关联内置路线。新增产品可用场景模板指定路线。');
+    if(str(row.RUNITS).toLowerCase()!=='min'||repeat<=0||lots<0||!Number.isInteger(pieces)||pieces<1)throw Error('订单到达间隔须为正分钟数，批量非负，每批片数为正整数。');
+    const d=parts.get(part)||{part,route:catalog.get(part),demand_lots:0,pieces_per_lot:pieces};
+    if(d.pieces_per_lot!==pieces)throw Error('同一产品的每批片数须一致。');
+    d.demand_lots+=0.25*DB.scene.horizon_min*lots/repeat;parts.set(part,d);
+  }
+  return {demands:[...parts.values()]};
+}
+function initialRows(rows){
+  const data=normalizeLayout(rows);
+  if(data.length!==slotByName.size||data.some(d=>!slotByName.has(d.equipment_name)))throw Error('起始布局须包含本厂全部 1,068 台设备，每台一次。');
+  return data.map(r=>{
+    const row={equipment_name:r.equipment_name,x:r.x,y:r.y};
+    for(const k of ['width','height','bay','tool_group'])if(r[k])row[k]=r[k];
+    for(const k of ['original_slot','new_slot'])if(r[k]!=='')row[k]=numberField(r[k],k);
+    return row;
+  }).sort((a,b)=>cmp(a.equipment_name,b.equipment_name));
+}
+async function readInitial(file){
+  const ext=checkFile(file);
+  if(ext==='csv')return initialRows(objects(csvRows(await file.text())));
+  if(ext==='json'){
+    const v=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
+    if(v&&!Array.isArray(v))checkGeometryFields(Object.keys(v).filter(k=>k!=='layout'));
+    return initialRows(Array.isArray(v)?v:v?.layout);
+  }
+  throw Error('起始布局支持 layout.csv 或含 layout 的 JSON。');
 }
 function normalizeLayout(rows){
   if(!Array.isArray(rows)||!rows.length||rows.length>50000)throw Error('布局表应包含 1 至 50,000 行设备。');
@@ -193,7 +250,7 @@ function normalizeLayout(rows){
 function readMetrics(raw){
   if(!raw||typeof raw!=='object')return {};
   const m={};
-  for(const k of ['reference_cost','optimized_cost','elapsed_sec','moved','lp_count','global_relative_gap_bound','primal_infeasibility']){
+  for(const k of ['reference_cost','optimized_cost','policy_cost','elapsed_sec','moved','lp_count','global_relative_gap_bound','primal_infeasibility']){
     if(raw[k]===undefined||raw[k]===null)continue;
     m[k]=numberField(raw[k],k);
     if(m[k]<0)throw Error('结果指标 '+k+' 必须为非负数。');
@@ -202,11 +259,14 @@ function readMetrics(raw){
   return m;
 }
 async function readResultFile(file){
-  const ext=checkFile(file);let layout,metrics={},scene=null,method=null,source=file.name,trace=null;
+  const ext=checkFile(file);let layout,metrics={},scene=null,method=null,source=file.name,trace=null,policy=null,reference=null,selection=null;
   if(ext==='json'){
     const data=JSON.parse((await file.text()).replace(/^\uFEFF/,''));
     if(data.schema && data.schema!=='fab-result-v1')throw Error('请选择 fab-result-v1 结果包或布局 CSV。');
     layout=Array.isArray(data)?data:data.layout;metrics=readMetrics(data.metrics);trace=data.replay;
+    if(data.policy_layout)policy=normalizeLayout(data.policy_layout);
+    if(data.reference_layout)reference=normalizeLayout(data.reference_layout);
+    selection=data.selection;
     if(data.scenario){scene=normalizeScene(data.scenario);method=data.method;if(!['heuristic_lp','rl'].includes(method))throw Error('结果包方法需填写 heuristic_lp 或 rl。');}
   }else if(ext==='csv')layout=objects(csvRows(await file.text()));
   else if(ext==='zip'){
@@ -214,6 +274,11 @@ async function readResultFile(file){
     const paths=Object.keys(z.files).filter(p=>!z.files[p].dir&&!p.startsWith('__MACOSX/')&&p.split('/').pop().toLowerCase()==='layout.csv');
     if(paths.length!==1)throw Error('ZIP 内须包含一份 layout.csv，请只打包一次求解的输出。');
     const p=paths[0], base=p.slice(0,p.lastIndexOf('/')+1);
+    if(z.file(base+'result.json')){
+      const raw=await zipEntry(z,base+'result.json');
+      let bundled;try{bundled=JSON.parse(raw);}catch{}
+      if(bundled?.schema==='fab-result-v1')return readResultFile(new File([raw],'result.json',{type:'application/json'}));
+    }
     layout=objects(csvRows(await zipEntry(z,p)));
     const meta=['e3_summary.json','summary.json'].map(f=>base+f).find(f=>z.file(f));
     if(meta){metrics=readMetrics(JSON.parse((await zipEntry(z,meta)).replace(/^\uFEFF/,'')));}
@@ -224,7 +289,8 @@ async function readResultFile(file){
   let replay=null;
   if(trace!=null){
     if(method!=='rl'||!scene||!Array.isArray(trace.slots)||trace.slots.length!==after.length)throw Error('推理回放与全厂设备数不一致。');
-    const bySlot=new Map(after.map(row=>[row.new_slot,row])),n=after.length;
+    const bySlot=new Map((policy||after).map(row=>[Number(row.new_slot),row])),n=after.length;
+    if(policy&&(policy.length!==n||policy.some(r=>!slotByName.has(r.equipment_name))))throw Error('候选布局的设备清单不完整。');
     if(bySlot.size!==n||new Set(trace.slots).size!==n||trace.slots.some(i=>!Number.isInteger(i)||i<0||i>=n||!bySlot.has(i)))throw Error('回放必须按真实动作逐一填满每个槽位。');
     const automatic=trace.automatic_steps||[];
     if(!Array.isArray(automatic)||automatic.some(i=>!Number.isInteger(i)||i<0||i>=n))throw Error('回放的自动放置步号无效。');
@@ -232,5 +298,7 @@ async function readResultFile(file){
     replay={rows:trace.slots.map(slot=>bySlot.get(slot)),automatic:new Set(automatic),
       cycle:Number.isInteger(trace.cycle)?trace.cycle:null,checkpoint:typeof trace.checkpoint==='string'?trace.checkpoint:''};
   }
-  return {kind:'external',title:replay?'PPO 推理布局':'导入的设备布局',source,replay,after,before:scene?DB.plant.slots:null,plant:!!scene,scene,method,metrics};
+  if(reference&&(reference.length!==after.length||reference.some(r=>!slotByName.has(r.equipment_name))))throw Error('输入布局的设备清单不完整。');
+  const before=reference||(scene?.initial_layout?scene.initial_layout.map(r=>({...slotByName.get(r.equipment_name),...r})):scene?DB.plant.slots:null);
+  return {kind:'external',title:replay?(selection==='initial'?'本次推荐保留输入布局':'PPO 推理布局'):'导入的设备布局',source,replay,after,before,policy,selection,plant:!!scene,scene,method,metrics};
 }

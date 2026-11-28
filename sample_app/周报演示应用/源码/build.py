@@ -109,7 +109,7 @@ def render_html(data):
           'DATA':data,
           'MODEL':(SRC/'io.js').read_text(encoding='utf-8'),
           'MAP':(SRC/'map.js').read_text(encoding='utf-8'),
-          'UI':'\n'.join((SRC/f).read_text(encoding='utf-8') for f in ['views.js','app.js'])}
+          'UI':'\n'.join((SRC/f).read_text(encoding='utf-8') for f in ['views.js','hosted.js','app.js'])}
     for k,v in vals.items():html=html.replace('<!-- '+k+' -->',v)
     out=APP/'晶圆厂布局工作台.html'
     newline='\r\n' if out.is_file() and b'\r\n' in out.read_bytes()[:100] else '\n'
@@ -119,6 +119,7 @@ def render_html(data):
 
 def main():
     EXAMPLES.mkdir(exist_ok=True)
+    (EXAMPLES/'05_订单.txt').write_bytes((SMT/'order.txt').read_bytes())
     with ZipFile(ROOT/'week7_heuristic.zip') as z:
         prefix='week7_heuristic/code/output/e3_global/'
         raw_layout=z.read(prefix+'layout.csv');metrics=json.loads(z.read(prefix+'e3_summary.json'))
@@ -150,8 +151,8 @@ def main():
                  rawCsv=b64(raw_layout))
     out=render_html(pack(archive).replace('<','\\u003c'))
     package=ROOT/'周报演示应用_离线版.zip'
-    source_files=['app.js','build.py','io.js','JSZip-LICENSE.md','jszip.min.js','map.js','shell.html','style.css','views.js']
-    examples=['01_基准生产场景.xlsx','02_产品配比变化.xlsx','03_启发式全厂布局.csv','04_启发式离线结果包.json']
+    source_files=['hosted.js','app.js','build.py','io.js','JSZip-LICENSE.md','jszip.min.js','map.js','shell.html','style.css','views.js']
+    examples=['01_基准生产场景.xlsx','02_产品配比变化.xlsx','03_启发式全厂布局.csv','04_启发式离线结果包.json','05_订单.txt']
     with ZipFile(package,'w',ZIP_DEFLATED,compresslevel=6) as z:
         for path in [out,APP/'周报演示与导入说明.md',*[EXAMPLES/f for f in examples],*[SRC/f for f in source_files]]:
             z.write(path,'周报演示应用/'+path.relative_to(APP).as_posix())
